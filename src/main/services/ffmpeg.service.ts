@@ -82,6 +82,7 @@ class FFmpegService {
       '-i', rtspUrl,                   // Input URL
       '-t', durationSeconds.toString(),// Duration limit
       '-c', 'copy',                    // Stream copy both video and audio (avoids crashing if stream has no audio)
+      '-movflags', '+faststart',       // Move index to start of file for fast web playback
       outputFilePath
     ];
 
@@ -162,8 +163,19 @@ class FFmpegService {
   public killRecording(matchId: string): boolean {
     const child = this.activeProcesses.get(matchId);
     if (child) {
-      console.log(`Killing active recording for match: ${matchId}`);
-      // Send SIGINT or SIGTERM to let FFmpeg finalize the MP4 index cleanly if possible
+      console.log(`Stopping active recording cleanly via stdin for match: ${matchId}`);
+      try {
+        if (child.stdin && child.stdin.writable) {
+          child.stdin.write('q\n');
+          child.stdin.end();
+          // Let the 'close' event trigger the cleanup naturally
+          return true;
+        }
+      } catch (err) {
+        console.error(`Failed to write 'q' to FFmpeg stdin, falling back to process kill:`, err);
+      }
+      
+      // Fallback if stdin is not writable or writing failed
       const killed = child.kill('SIGTERM') || child.kill('SIGKILL');
       this.cleanup(matchId);
       return killed;

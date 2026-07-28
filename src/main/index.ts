@@ -1,6 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron';
 import { join } from 'path';
 import fs from 'fs';
+import { spawn, ChildProcess } from 'child_process';
 import { electronApp, optimizer, is } from '@electron-toolkit/utils';
 import icon from '../../resources/icon.png?asset';
 
@@ -28,6 +29,13 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => {
     mainWindow.show();
+  });
+
+  // Redirect renderer logs to main console for diagnostics
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    // Keep it clean: extract only the filename from the sourceId URL
+    const file = sourceId ? sourceId.split('/').pop() : 'unknown';
+    console.log(`[Renderer] [Lvl ${level}] ${message} (${file}:${line})`);
   });
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -199,6 +207,168 @@ function registerIpcHandlers(): void {
       return { success: false, error: (error as Error).message };
     }
   });
+
+  // 7. Auto-start on login configuration
+  ipcMain.handle('config:get-startup', () => {
+    const settings = app.getLoginItemSettings();
+    return settings.openAtLogin;
+  });
+
+  ipcMain.handle('config:save-startup', (_, enabled: boolean) => {
+    try {
+      app.setLoginItemSettings({
+        openAtLogin: enabled,
+        path: app.getPath('exe')
+      });
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to set login item settings:', error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  // 8. Session management (persists for 2 months if rememberMe is selected)
+  ipcMain.handle('session:get', () => {
+    const expiryStr = vaultService.getSecret('SESSION_EXPIRY');
+    if (!expiryStr) return { loggedIn: false };
+    
+    const expiry = new Date(expiryStr);
+    const now = new Date();
+    if (now > expiry) {
+      vaultService.deleteSecret('SESSION_EXPIRY');
+      vaultService.deleteSecret('SESSION_OPERATOR');
+      return { loggedIn: false };
+    }
+    
+    return { 
+      loggedIn: true, 
+      operatorName: vaultService.getSecret('SESSION_OPERATOR') || 'Administrador',
+      expiry: expiryStr
+    };
+  });
+
+  ipcMain.handle('session:save', (_, operatorName: string, rememberMe: boolean) => {
+    try {
+      const expiry = new Date();
+      if (rememberMe) {
+        // 2 months duration
+        expiry.setMonth(expiry.getMonth() + 2);
+      } else {
+        // 12 hours temporary session
+        expiry.setHours(expiry.getHours() + 12);
+      }
+      vaultService.setSecret('SESSION_EXPIRY', expiry.toISOString());
+      vaultService.setSecret('SESSION_OPERATOR', operatorName);
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to save session:', error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('session:clear', () => {
+    try {
+      vaultService.deleteSecret('SESSION_EXPIRY');
+      vaultService.deleteSecret('SESSION_OPERATOR');
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to clear session:', error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  // 9. Notifications configuration
+  ipcMain.handle('config:get-notifications', () => {
+    return vaultService.getSecret('NOTIFICATIONS_ENABLED') !== 'false';
+  });
+
+  ipcMain.handle('config:save-notifications', (_, enabled: boolean) => {
+    try {
+      vaultService.setSecret('NOTIFICATIONS_ENABLED', enabled ? 'true' : 'false');
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to save notifications setting:', error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  // 10. Native scale zoom configuration
+  ipcMain.handle('config:set-zoom-factor', (event, factor: number) => {
+    try {
+      const webContents = event.sender;
+      webContents.setZoomFactor(factor);
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to set zoom factor:', error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  // 11. Live Camera Streaming handlers (RTSP -> JSMpeg / IPC)
+  ipcMain.handle('stream:start', (event, { courtId, rtspUrl }) => {
+    console.log(`[IPC] stream:start requested for court ${courtId} with RTSP URL: ${rtspUrl}`);
+    if (activeStreams.has(courtId)) {
+      console.log(`[IPC] Stream for court ${courtId} is already active.`);
+      return { success: true, message: 'Stream already active' };
+    }
+
+    try {
+      const ffmpegPath = ffmpegService.getFFmpegPath();
+      const args = [
+        '-rtsp_transport', 'tcp',
+        '-i', rtspUrl,
+        '-f', 'mpegts',
+        '-codec:v', 'mpeg1video',
+        '-s', '640x360',
+        '-b:v', '800k',
+        '-r', '25',
+        '-bf', '0',
+        '-'
+      ];
+
+      console.log(`[IPC] Spawning FFmpeg stream process: ${ffmpegPath} ${args.join(' ')}`);
+      const proc = spawn(ffmpegPath, args);
+      activeStreams.set(courtId, proc);
+
+      const webContents = event.sender;
+      let chunkCount = 0;
+
+      proc.stdout.on('data', (data: Buffer) => {
+        chunkCount++;
+        if (chunkCount <= 5 || chunkCount % 100 === 0) {
+          console.log(`[IPC] stream for court ${courtId}: sent chunk #${chunkCount} (size: ${data.length} bytes)`);
+        }
+        if (!webContents.isDestroyed()) {
+          webContents.send(`stream:data:${courtId}`, data);
+        }
+      });
+
+      proc.stderr.on('data', (data) => {
+        // Keep a log of FFmpeg stderr to debug connection or codec issues
+        console.log(`[FFmpeg Stream ${courtId} Stderr]:`, data.toString().trim());
+      });
+
+      proc.on('close', (code) => {
+        console.log(`[IPC] FFmpeg Stream process for court ${courtId} closed with exit code ${code}`);
+        activeStreams.delete(courtId);
+      });
+
+      return { success: true };
+    } catch (error) {
+      console.error(`[IPC] Failed to start streaming for court ${courtId}:`, error);
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('stream:stop', (_, courtId) => {
+    const proc = activeStreams.get(courtId);
+    if (proc) {
+      proc.kill('SIGKILL');
+      activeStreams.delete(courtId);
+      return { success: true };
+    }
+    return { success: false, error: 'No stream active' };
+  });
 }
 
 app.whenReady().then(() => {
@@ -225,7 +395,20 @@ app.whenReady().then(() => {
   });
 });
 
+const activeStreams = new Map<string, ChildProcess>();
+
 app.on('window-all-closed', () => {
+  // Kill all live streaming processes
+  for (const [courtId, proc] of activeStreams.entries()) {
+    try {
+      proc.kill('SIGKILL');
+      console.log(`Terminated stream process for court ${courtId} on close.`);
+    } catch (err) {
+      console.error(`Error killing stream process:`, err);
+    }
+  }
+  activeStreams.clear();
+
   if (process.platform !== 'darwin') {
     schedulerService.stop();
     app.quit();

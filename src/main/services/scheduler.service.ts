@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, Notification } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { dbService } from './db.service';
@@ -175,6 +175,10 @@ class SchedulerService {
 
       if (updateErr) throw updateErr;
       this.notifyUI('match-updated', match.id);
+      this.showNotification(
+        'Grabación Iniciada',
+        `Se ha iniciado la grabación para ${match.player_name} en la cancha ${court.name}.`
+      );
 
       // 3. Trigger FFmpeg recording
       ffmpegService.startRecording({
@@ -191,10 +195,18 @@ class SchedulerService {
         },
         onComplete: async (savedPath) => {
           console.log(`Recording complete for match ${match.id}. Local file: ${savedPath}`);
+          this.showNotification(
+            'Grabación Finalizada',
+            `La grabación para ${match.player_name} finalizó. Procesando subida...`
+          );
           await this.processUploadStart(match, savedPath);
         },
         onError: async (err) => {
           console.error(`Recording error for match ${match.id}:`, err);
+          this.showNotification(
+            'Error de Grabación',
+            `Ocurrió un error al grabar el partido de ${match.player_name}.`
+          );
           await db
             .from('matches')
             .update({ status: 'FAILED', error_log: err.message })
@@ -253,6 +265,10 @@ class SchedulerService {
         })
         .eq('id', match.id);
       this.notifyUI('match-updated', match.id);
+      this.showNotification(
+        'Video Listo',
+        `El partido de ${match.player_name} se subió con éxito a la nube.`
+      );
 
       // 4. Delete the local temp video file
       fs.unlink(filePath, (err) => {
@@ -261,6 +277,10 @@ class SchedulerService {
       });
     } catch (err) {
       console.error(`Failed uploading match video ${match.id}:`, err);
+      this.showNotification(
+        'Error de Subida',
+        `No se pudo subir el video de ${match.player_name} a la nube.`
+      );
       await db
         .from('matches')
         .update({
@@ -353,6 +373,20 @@ class SchedulerService {
         win.webContents.send(channel, payload);
       }
     });
+  }
+
+  /**
+   * Helper to show native system notifications at the OS/Windows level.
+   */
+  private showNotification(title: string, body: string): void {
+    const notificationsEnabled = vaultService.getSecret('NOTIFICATIONS_ENABLED') !== 'false';
+    if (notificationsEnabled && Notification.isSupported()) {
+      new Notification({
+        title,
+        body,
+        silent: false
+      }).show();
+    }
   }
 }
 
