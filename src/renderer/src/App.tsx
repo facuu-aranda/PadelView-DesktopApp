@@ -378,7 +378,7 @@ function App(): React.JSX.Element {
 
   // Listen for token refreshes to keep Main Process authenticated
   useEffect(() => {
-    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.access_token && window.electron) {
         await window.electron.ipcRenderer.invoke('session:set-token', session.access_token)
       }
