@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput } from '@aws-sdk/client-s3'
+import { S3Client, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput, DeleteObjectsCommand } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { vaultService } from './vault.service'
@@ -39,6 +39,7 @@ class R2Service {
     const client = new S3Client({
       region: 'auto',
       endpoint: endpoint,
+      forcePathStyle: true,
       credentials: {
         accessKeyId,
         secretAccessKey
@@ -179,6 +180,52 @@ class R2Service {
     } catch (error) {
       console.error('Failed to get bucket usage:', error)
       return 0
+    }
+  }
+
+  public async deleteOldVideos(retentionDays: number): Promise<void> {
+    try {
+      const { client, bucket } = this.getS3Client()
+      const cutoffTime = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+      
+      let isTruncated = true
+      let continuationToken: string | undefined = undefined
+      let totalDeleted = 0
+
+      while (isTruncated) {
+        const command = new ListObjectsV2Command({
+          Bucket: bucket,
+          ContinuationToken: continuationToken
+        })
+        const response = (await client.send(command)) as ListObjectsV2CommandOutput
+        
+        if (response.Contents && response.Contents.length > 0) {
+          const objectsToDelete = response.Contents.filter(obj => 
+            obj.LastModified && new Date(obj.LastModified) < cutoffTime
+          ).map(obj => ({ Key: obj.Key as string }))
+
+          if (objectsToDelete.length > 0) {
+            const deleteCommand = new DeleteObjectsCommand({
+              Bucket: bucket,
+              Delete: {
+                Objects: objectsToDelete,
+                Quiet: true
+              }
+            })
+            await client.send(deleteCommand)
+            totalDeleted += objectsToDelete.length
+          }
+        }
+        
+        isTruncated = response.IsTruncated ?? false
+        continuationToken = response.NextContinuationToken
+      }
+
+      if (totalDeleted > 0) {
+        console.log(`Deleted ${totalDeleted} old videos from R2 successfully (Retention: ${retentionDays} days).`)
+      }
+    } catch (error) {
+      console.error('Failed to delete old videos:', error)
     }
   }
 }

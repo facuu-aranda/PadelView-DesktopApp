@@ -17,7 +17,6 @@ import {
   Share2,
   Copy,
   Grid,
-  Lock,
   ChevronLeft,
   ChevronRight,
   MoreVertical,
@@ -28,6 +27,8 @@ import {
 import padelCourtSvg from './assets/PadelCourt.svg'
 import logoPng from './assets/logo.png'
 import CameraScannerModal from './components/CameraScannerModal'
+import LoginScreen from './components/LoginScreen'
+import { supabase } from './lib/supabase'
 
 interface Court {
   id: string
@@ -273,11 +274,8 @@ function App(): React.JSX.Element {
 
   // Login States
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false)
-  const [loginView, setLoginView] = useState<'login' | 'recover'>('login')
-  const [loginOperator, setLoginOperator] = useState<string>('Operador Local')
-  const [username, setUsername] = useState<string>('')
-  const [password, setPassword] = useState<string>('')
-  const [rememberMe, setRememberMe] = useState<boolean>(true)
+  const [isConfigured, setIsConfigured] = useState<boolean | null>(null)
+  const [sessionUser, setSessionUser] = useState<any>(null)
 
   // Zoom / scale general state
   const [appScale, setAppScale] = useState<string>('100%')
@@ -306,8 +304,8 @@ function App(): React.JSX.Element {
   const [profileAvatar, setProfileAvatar] = useState<string>('')
   const [clubName, setClubName] = useState<string>('Club Sportivo Belgrano')
   const [clubRole, setClubRole] = useState<string>('Administrador de Turnos')
-  const [subType, setSubType] = useState<'active' | 'lifetime' | 'inactive'>('lifetime')
-  const [subExpiry, setSubExpiry] = useState<string>('31/12/2026')
+  const [subType, setSubType] = useState<'free' | 'pro' | 'elite' | 'vitalicia'>('free')
+  const [subExpiry, setSubExpiry] = useState<string>('N/A')
 
   // Theme Settings
   const [themeMode, setThemeMode] = useState<'light' | 'dark'>('dark')
@@ -378,33 +376,107 @@ function App(): React.JSX.Element {
     return () => window.removeEventListener('click', closeDropdown)
   }, [])
 
-  // Login handler
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault()
+  // Listen for token refreshes to keep Main Process authenticated
+  useEffect(() => {
+    const { data: authListener } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session?.access_token && window.electron) {
+        await window.electron.ipcRenderer.invoke('session:set-token', session.access_token)
+      }
+    })
 
-    // Simulate authorization (fallback to Operador Local if empty)
-    const operator = username.trim() || 'Operador Local'
-    setLoginOperator(operator)
-    setProfileName(operator)
+    return () => {
+      authListener.subscription.unsubscribe()
+    }
+  }, [])
 
-    const res = await window.electron.ipcRenderer.invoke('session:save', operator, rememberMe)
-    if (res.success) {
-      setIsLoggedIn(true)
-      showToast(`¡Bienvenido, ${operator}!`, 'success')
+  // Login success handler from LoginScreen
+  const handleLoginSuccess = async (session: any) => {
+    setIsLoggedIn(true)
+    setSessionUser(session.user)
+    
+    // Set token in Main Process so dbService uses the Anon Key with RLS
+    if (window.electron) {
+      await window.electron.ipcRenderer.invoke('session:set-token', session.access_token)
+    }
+    
+    // Check user profile for configuration status
+    let { data: profile, error } = await supabase
+      .from('profiles')
+      .select('is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url')
+      .eq('id', session.user.id)
+      .maybeSingle()
+
+    // If profile doesn't exist (e.g. old user before triggers), create it
+    if (!profile && !error) {
+      const { data: newProfile, error: insertErr } = await supabase
+        .from('profiles')
+        .insert({
+          id: session.user.id,
+          email: session.user.email,
+          full_name: session.user.user_metadata?.full_name || session.user.email,
+          role: 'client'
+        })
+        .select('is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url')
+        .single()
+      
+      if (!insertErr && newProfile) {
+        profile = newProfile
+      }
+    }
+      
+    if (profile) {
+      setIsConfigured(profile.is_configured)
+      const name = profile.full_name || session.user.email
+      setProfileName(name)
+      if (profile.club_name) setClubName(profile.club_name)
+      if (profile.club_role) setClubRole(profile.club_role)
+      if (profile.subscription_type) setSubType(profile.subscription_type.toLowerCase() as any)
+      if (profile.subscription_expiry) setSubExpiry(new Date(profile.subscription_expiry).toLocaleDateString())
+      if (profile.avatar_url) setProfileAvatar(profile.avatar_url)
+      
+      // Update window title dynamically
+      if (window.electron) {
+        window.electron.ipcRenderer.send('window:set-title', `ViewPadel - ${name}`)
+      }
+      
+      // If configured, fetch config from DB and save it to the local vault securely!
+      if (profile.is_configured) {
+        const { data: clientConfig } = await supabase
+          .from('client_configs')
+          .select('*')
+          .eq('profile_id', session.user.id)
+          .single()
+          
+        if (clientConfig) {
+          if (window.electron) {
+            await window.electron.ipcRenderer.invoke('config:save', {
+              R2_BUCKET_NAME: clientConfig.r2_bucket_name,
+              R2_ACCESS_KEY_ID: clientConfig.r2_access_key_id,
+              R2_SECRET_ACCESS_KEY: clientConfig.r2_secret_access_key,
+              R2_ENDPOINT: clientConfig.r2_endpoint
+            })
+          }
+          fetchData()
+        }
+      }
     } else {
-      showToast('Error al guardar la sesión.', 'error')
+      console.error('Profile fetch error:', error)
+      setIsConfigured(false)
     }
   }
 
   // Logout handler
   const handleLogout = async () => {
-    const res = await window.electron.ipcRenderer.invoke('session:clear')
-    if (res.success) {
-      setIsLoggedIn(false)
-      setUsername('')
-      setPassword('')
-      showToast('Sesión cerrada.', 'info')
+    await supabase.auth.signOut()
+    if (window.electron) {
+      await window.electron.ipcRenderer.invoke('session:clear')
+      await window.electron.ipcRenderer.invoke('session:set-token', null)
+      window.electron.ipcRenderer.send('window:set-title', 'ViewPadel')
     }
+    setIsLoggedIn(false)
+    setIsConfigured(null)
+    setSessionUser(null)
+    showToast('Sesión cerrada.', 'info')
   }
 
   // Play video handler
@@ -416,12 +488,14 @@ function App(): React.JSX.Element {
     }
     setPlayingVideoId(matchId)
     setPlayingVideoUrl(null)
-    const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', match.video_key)
-    if (res.success) {
-      setPlayingVideoUrl(res.url)
-    } else {
-      showToast('Error al obtener URL del video', 'error')
-      setPlayingVideoId(null)
+    if (window.electron) {
+      const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', match.video_key)
+      if (res.success) {
+        setPlayingVideoUrl(res.url)
+      } else {
+        showToast('Error al obtener URL del video', 'error')
+        setPlayingVideoId(null)
+      }
     }
   }
 
@@ -432,17 +506,19 @@ function App(): React.JSX.Element {
       showToast('Este partido no tiene un video procesado aún.', 'warning')
       return
     }
-    const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', match.video_key, true)
-    if (res.success) {
-      const a = document.createElement('a')
-      a.href = res.url
-      a.download = ''
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      showToast('Iniciando descarga...', 'success')
-    } else {
-      showToast('Error al obtener URL del video', 'error')
+    if (window.electron) {
+      const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', match.video_key, true)
+      if (res.success) {
+        const a = document.createElement('a')
+        a.href = res.url
+        a.download = ''
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        showToast('Iniciando descarga...', 'success')
+      } else {
+        showToast('Error al obtener URL del video', 'error')
+      }
     }
   }
 
@@ -498,10 +574,12 @@ function App(): React.JSX.Element {
       '150%': 1.5
     }
     const factor = factorMap[appScale] || 1.0
-    window.electron.ipcRenderer.invoke('config:set-zoom-factor', factor)
+    if (window.electron) {
+      window.electron.ipcRenderer.invoke('config:set-zoom-factor', factor)
+    }
 
     if (config.R2_BUCKET_NAME) {
-      console.log(`PadelView S3 bucket initialized: ${config.R2_BUCKET_NAME}`)
+      console.log(`ViewPadel S3 bucket initialized: ${config.R2_BUCKET_NAME}`)
     }
   }, [appScale, config])
 
@@ -529,24 +607,12 @@ function App(): React.JSX.Element {
       setDefaultPreviewEnabled(defaultPreview)
 
       // Load native Windows notifications preference
-      const notifyEnabled = await window.electron.ipcRenderer.invoke('config:get-notifications')
-      setNotificationsEnabled(notifyEnabled)
-
-      // Load custom profile settings
-      const savedProfile = localStorage.getItem('profileSettings')
-      if (savedProfile) {
-        try {
-          const parsed = JSON.parse(savedProfile)
-          if (parsed.profileName) setProfileName(parsed.profileName)
-          if (parsed.profileAvatar) setProfileAvatar(parsed.profileAvatar)
-          if (parsed.clubName) setClubName(parsed.clubName)
-          if (parsed.clubRole) setClubRole(parsed.clubRole)
-          if (parsed.subType) setSubType(parsed.subType)
-          if (parsed.subExpiry) setSubExpiry(parsed.subExpiry)
-        } catch (err) {
-          console.error(err)
-        }
+      if (window.electron) {
+        const notifyEnabled = await window.electron.ipcRenderer.invoke('config:get-notifications')
+        setNotificationsEnabled(notifyEnabled)
       }
+
+      // (Profile settings are now fetched on login from DB)
     }
     loadSettings()
   }, [])
@@ -556,48 +622,85 @@ function App(): React.JSX.Element {
     setLoadingDb(true)
     try {
       // Check FFmpeg
-      const ffmpeg = await window.electron.ipcRenderer.invoke('ffmpeg:check')
-      setFfmpegStatus(ffmpeg)
+      if (window.electron) {
+        const ffmpeg = await window.electron.ipcRenderer.invoke('ffmpeg:check')
+        setFfmpegStatus(ffmpeg)
+      }
 
       // Load Config
-      const savedConfig = await window.electron.ipcRenderer.invoke('config:get')
-      setConfig(savedConfig)
+      if (window.electron) {
+        const savedConfig = await window.electron.ipcRenderer.invoke('config:get')
+        setConfig(savedConfig)
+      }
 
       // Load Bucket Usage
-      const usageRes = await window.electron.ipcRenderer.invoke('config:get-bucket-usage')
-      if (usageRes.success) {
-        setBucketUsageBytes(usageRes.usageBytes)
+      if (window.electron) {
+        const usageRes = await window.electron.ipcRenderer.invoke('config:get-bucket-usage')
+        if (usageRes.success) {
+          setBucketUsageBytes(usageRes.usageBytes)
+        }
       }
 
       // Load Auto-start
-      const startup = await window.electron.ipcRenderer.invoke('config:get-startup')
-      setLaunchOnStartup(startup)
+      if (window.electron) {
+        const startup = await window.electron.ipcRenderer.invoke('config:get-startup')
+        setLaunchOnStartup(startup)
+      }
 
-      // Load database records
-      const courtsRes = await window.electron.ipcRenderer.invoke('db:get-courts')
-      if (courtsRes.success) {
-        setCourts(courtsRes.data)
-        if (courtsRes.data.length > 0 && !newMatch.court_id) {
-          setNewMatch((prev) => ({ ...prev, court_id: courtsRes.data[0].id }))
-        }
-
-        // Fetch RTSP urls for courts
-        const rtspDict: Record<string, string> = {}
-        for (const c of courtsRes.data) {
-          const url = await window.electron.ipcRenderer.invoke('config:get-rtsp', c.id)
-          rtspDict[c.id] = url || c.rtsp_url_key
-        }
-        setCourtRtspUrls(rtspDict)
-      } else {
-        if (courtsRes.error.includes('configuration missing')) {
-          setConfigError('Por favor configura Supabase y Cloudflare R2 para comenzar.')
+      // Refresh Profile Data
+      const { data: sessionData } = await supabase.auth.getSession()
+      if (sessionData.session?.user) {
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url')
+          .eq('id', sessionData.session.user.id)
+          .maybeSingle()
+          
+        if (profile) {
+          setIsConfigured(profile.is_configured)
+          setProfileName(profile.full_name || sessionData.session.user.email || 'Operador')
+          if (profile.club_name) setClubName(profile.club_name)
+          if (profile.club_role) setClubRole(profile.club_role)
+          if (profile.subscription_type) setSubType(profile.subscription_type.toLowerCase() as any)
+          if (profile.subscription_expiry) setSubExpiry(new Date(profile.subscription_expiry).toLocaleDateString())
+          else setSubExpiry('N/A')
+          
+          if (profile.avatar_url) setProfileAvatar(profile.avatar_url)
+          else setProfileAvatar('')
+          
+          if (window.electron) {
+            window.electron.ipcRenderer.send('window:set-title', `ViewPadel - ${profile.full_name || sessionData.session.user.email}`)
+          }
         }
       }
 
-      const matchesRes = await window.electron.ipcRenderer.invoke('db:get-matches')
-      if (matchesRes.success) {
-        setMatches(matchesRes.data)
-        setConfigError(null)
+      // Load database records
+      if (window.electron) {
+        const courtsRes = await window.electron.ipcRenderer.invoke('db:get-courts')
+        if (courtsRes.success) {
+          setCourts(courtsRes.data)
+          if (courtsRes.data.length > 0 && !newMatch.court_id) {
+            setNewMatch((prev) => ({ ...prev, court_id: courtsRes.data[0].id }))
+          }
+
+          // Fetch RTSP urls for courts
+          const rtspDict: Record<string, string> = {}
+          for (const c of courtsRes.data) {
+            const url = await window.electron.ipcRenderer.invoke('config:get-rtsp', c.id)
+            rtspDict[c.id] = url || c.rtsp_url_key
+          }
+          setCourtRtspUrls(rtspDict)
+        } else {
+          if (courtsRes.error.includes('configuration missing')) {
+            setConfigError('Por favor configura Supabase y Cloudflare R2 para comenzar.')
+          }
+        }
+
+        const matchesRes = await window.electron.ipcRenderer.invoke('db:get-matches')
+        if (matchesRes.success) {
+          setMatches(matchesRes.data)
+          setConfigError(null)
+        }
       }
     } catch (err) {
       console.error('Error fetching dashboard data:', err)
@@ -606,19 +709,11 @@ function App(): React.JSX.Element {
     }
   }
 
-  // Check persistent session on startup
+  // Check persistent session on startup is now handled directly by Supabase in LoginScreen,
+  // but we still want to setup listeners
   useEffect(() => {
-    const checkSession = async () => {
-      const res = await window.electron.ipcRenderer.invoke('session:get')
-      if (res.loggedIn) {
-        setIsLoggedIn(true)
-        setLoginOperator(res.operatorName)
-        setProfileName(res.operatorName)
-      }
-      fetchData()
-    }
-    checkSession()
-
+    if (!window.electron) return
+    
     // Listen to real-time events from scheduler/main process
     const handleRecProgress = (_event: any, data: ActiveRecording) => {
       setActiveRecordings((prev) => ({
@@ -649,15 +744,18 @@ function App(): React.JSX.Element {
 
     return () => {
       // Clean listeners
-      window.electron.ipcRenderer.removeAllListeners('recording-progress')
-      window.electron.ipcRenderer.removeAllListeners('upload-progress')
-      window.electron.ipcRenderer.removeAllListeners('match-updated')
-      window.electron.ipcRenderer.removeAllListeners('config-error')
+      if (window.electron) {
+        window.electron.ipcRenderer.removeAllListeners('recording-progress')
+        window.electron.ipcRenderer.removeAllListeners('upload-progress')
+        window.electron.ipcRenderer.removeAllListeners('match-updated')
+        window.electron.ipcRenderer.removeAllListeners('config-error')
+      }
     }
   }, [])
 
   // Save specific court RTSP url
   const handleSaveCourtRtsp = async (courtId: string, url: string) => {
+    if (!window.electron) return
     const res = await window.electron.ipcRenderer.invoke('config:save-rtsp', courtId, url)
     if (res.success) {
       setCourtRtspUrls((prev) => ({ ...prev, [courtId]: url }))
@@ -670,12 +768,13 @@ function App(): React.JSX.Element {
   // Create new court
   const handleCreateCourt = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newCourt.name) return
+    if (!newCourt.name || !window.electron) return
 
     const res = await window.electron.ipcRenderer.invoke(
       'db:create-court',
       newCourt.name,
-      newCourt.rtsp_url
+      newCourt.rtsp_url,
+      sessionUser?.id
     )
     if (res.success) {
       showToast('Cancha agregada exitosamente.', 'success')
@@ -688,6 +787,7 @@ function App(): React.JSX.Element {
 
   // Delete existing court
   const handleDeleteCourt = async (courtId: string) => {
+    if (!window.electron) return
     const res = await window.electron.ipcRenderer.invoke('db:delete-court', courtId)
     if (res.success) {
       showToast('Cancha eliminada exitosamente.', 'success')
@@ -702,7 +802,7 @@ function App(): React.JSX.Element {
   const handleCreateMatch = async (e: React.FormEvent) => {
     e.preventDefault()
     const { court_id, date, time, duration, player_name, player_phone } = newMatch
-    if (!court_id || !date || !time || !player_name || !player_phone) {
+    if (!court_id || !date || !time || !player_name || !player_phone || !window.electron) {
       showToast('Por favor completa todos los campos del partido.', 'error')
       return
     }
@@ -726,7 +826,7 @@ function App(): React.JSX.Element {
       end_time: endTime.toISOString(),
       player_name,
       player_phone: formattedPhone
-    })
+    }, sessionUser?.id)
 
     if (res.success) {
       showToast('Partido agendado correctamente.', 'success')
@@ -746,6 +846,7 @@ function App(): React.JSX.Element {
 
   // Manual start recording on-demand
   const handleStartRecordingOnDemand = async (courtId: string) => {
+    if (!window.electron) return
     const startTime = new Date()
     const endTime = new Date(startTime.getTime() + 90 * 60000) // 90 min duration by default
 
@@ -755,7 +856,7 @@ function App(): React.JSX.Element {
       end_time: endTime.toISOString(),
       player_name: 'Grabación Manual',
       player_phone: '+5490000000000'
-    })
+    }, sessionUser?.id)
 
     if (res.success) {
       showToast('Grabación manual iniciada. Conectando con la cámara...', 'success')
@@ -767,7 +868,7 @@ function App(): React.JSX.Element {
 
   // Delete match
   const handleDeleteMatch = async (matchId: string) => {
-    if (!confirm('¿Estás seguro de que deseas eliminar este partido?')) return
+    if (!confirm('¿Estás seguro de que deseas eliminar este partido?') || !window.electron) return
     const res = await window.electron.ipcRenderer.invoke('db:delete-match', matchId)
     if (res.success) {
       showToast('Partido eliminado.', 'success')
@@ -782,7 +883,7 @@ function App(): React.JSX.Element {
     if (
       !confirm(
         '¿Detener esta grabación manualmente? Se subirá el video parcial obtenido hasta el momento.'
-      )
+      ) || !window.electron
     )
       return
     const res = await window.electron.ipcRenderer.invoke('recordings:kill', matchId)
@@ -801,7 +902,7 @@ function App(): React.JSX.Element {
 
   // Cancel active upload manually
   const handleCancelUpload = async (matchId: string) => {
-    if (!confirm('¿Cancelar la subida de este video?')) return
+    if (!confirm('¿Cancelar la subida de este video?') || !window.electron) return
     const res = await window.electron.ipcRenderer.invoke('uploads:cancel', matchId)
     if (res.success) {
       showToast('Subida cancelada.', 'warning')
@@ -816,6 +917,7 @@ function App(): React.JSX.Element {
 
   // Auto start toggle
   const handleToggleStartup = async (enabled: boolean) => {
+    if (!window.electron) return
     const res = await window.electron.ipcRenderer.invoke('config:save-startup', enabled)
     if (res.success) {
       setLaunchOnStartup(enabled)
@@ -829,18 +931,23 @@ function App(): React.JSX.Element {
   }
 
   // Save profile settings
-  const handleSaveProfile = (e: React.FormEvent) => {
+  const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault()
-    const settings = {
-      profileName,
-      profileAvatar,
-      clubName,
-      clubRole,
-      subType,
-      subExpiry
+    
+    // Save to DB
+    const { data: sessionData } = await supabase.auth.getSession()
+    if (sessionData.session?.user) {
+      const { error } = await supabase.from('profiles').update({
+        full_name: profileName,
+        avatar_url: profileAvatar
+      }).eq('id', sessionData.session.user.id)
+      
+      if (error) {
+        showToast('Error al guardar en la base de datos: ' + error.message, 'error')
+        return
+      }
     }
-    localStorage.setItem('profileSettings', JSON.stringify(settings))
-    setLoginOperator(profileName)
+
     showToast('Perfil actualizado correctamente.', 'success')
   }
 
@@ -881,112 +988,105 @@ function App(): React.JSX.Element {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
   }
 
-  // Render Login overlay or Recover overlay if not authenticated
+  // Render Login overlay or Setup overlay if not authenticated/configured
   if (!isLoggedIn) {
-    if (loginView === 'recover') {
-      return (
-        <div className="login-overlay">
-          <div className="login-box">
-            <div className="login-header">
-              <div className="login-logo" style={{ background: 'transparent', boxShadow: 'none' }}>
-                <img src={logoPng} alt="PadelView Logo" style={{ width: '100%', height: '100%', objectFit: 'contain', filter: 'drop-shadow(0 0 12px rgba(16, 185, 129, 0.6))' }} />
-              </div>
-              <h2>Recuperar Contraseña</h2>
-              <p>Ingresa tu correo para restablecer tu clave</p>
-            </div>
+    return <LoginScreen onLogin={handleLoginSuccess} />
+  }
 
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                showToast('Enlace de recuperación enviado al correo.', 'success')
-                setLoginView('login')
-              }}
-              className="login-form form-grid"
-            >
-              <div className="form-group">
-                <label>Correo Electrónico</label>
-                <input type="email" placeholder="ejemplo@club.com" required />
-              </div>
-
-              <button type="submit" className="btn btn-primary btn-block">
-                Enviar Enlace
-              </button>
-
-              <button
-                type="button"
-                className="btn btn-secondary btn-block"
-                onClick={() => setLoginView('login')}
-              >
-                Volver al Login
-              </button>
-            </form>
-          </div>
-        </div>
-      )
-    }
-
+  if (isLoggedIn && isConfigured === false) {
     return (
-      <div className="login-overlay">
-        <div className="login-box">
-          <div className="login-header">
-            <div className="login-logo" style={{ background: 'transparent', boxShadow: 'none' }}>
-              <img src={logoPng} alt="PadelView Logo" style={{ width: '100%', height: '100%', objectFit: 'contain', filter: 'drop-shadow(0 0 12px rgba(16, 185, 129, 0.6))' }} />
-            </div>
-            <h2>Ingresar a PadelView</h2>
-            <p>Controlador de Canchas y Grabación</p>
+      <div style={{
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh',
+        backgroundColor: '#0B0F19', color: 'white', padding: '20px', position: 'relative'
+      }}>
+        {/* CSS inyectado localmente para el fondo y animaciones */}
+        <style>{`
+          @keyframes fade-in {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+          }
+          .block-fade-in {
+            animation: fade-in 0.8s ease-out forwards;
+          }
+          .page-bg {
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+            z-index: 0; overflow: hidden; pointer-events: none;
+          }
+          .bg-orb {
+            position: absolute; border-radius: 50%; filter: blur(80px); opacity: 0.15;
+          }
+          .orb-1 { width: 600px; height: 600px; background: #10b981; top: -200px; left: -200px; }
+          .orb-2 { width: 500px; height: 500px; background: #f59e0b; bottom: -100px; right: -100px; }
+          .grid-lines {
+            position: absolute; inset: 0;
+            background-image: 
+              linear-gradient(to right, rgba(255,255,255,0.03) 1px, transparent 1px),
+              linear-gradient(to bottom, rgba(255,255,255,0.03) 1px, transparent 1px);
+            background-size: 50px 50px;
+            mask-image: radial-gradient(circle at center, black 30%, transparent 80%);
+            -webkit-mask-image: radial-gradient(circle at center, black 30%, transparent 80%);
+          }
+          .pulse-warning {
+            animation: pulse-warning 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+          }
+          @keyframes pulse-warning {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+          }
+        `}</style>
+        
+        <div className="page-bg">
+          <div className="bg-orb orb-1"></div>
+          <div className="bg-orb orb-2"></div>
+          <div className="grid-lines"></div>
+        </div>
+
+        <div className="block-fade-in" style={{
+          backgroundColor: 'rgba(15, 23, 42, 0.6)', padding: '50px 40px', borderRadius: '24px', width: '100%', maxWidth: '480px', textAlign: 'center',
+          backdropFilter: 'blur(20px)', border: '1px solid rgba(245,158,11,0.2)', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)', zIndex: 1
+        }}>
+          
+          <div className="pulse-warning" style={{
+            width: '80px', height: '80px', borderRadius: '50%', backgroundColor: 'rgba(245,158,11,0.1)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 24px auto',
+            border: '1px solid rgba(245,158,11,0.2)'
+          }}>
+            <AlertTriangle size={40} color="#f59e0b" />
           </div>
 
-          <form onSubmit={handleLogin} className="login-form form-grid">
-            <div className="form-group">
-              <label>Usuario / Recepcionista</label>
-              <input
-                type="text"
-                placeholder="Ej. Recepción (dejar vacío para rápido)"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-              />
-            </div>
-
-            <div className="form-group">
-              <label>Contraseña</label>
-              <input
-                type="password"
-                placeholder="••••••••"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-
-            <label className="login-checkbox-group">
-              <input
-                type="checkbox"
-                checked={rememberMe}
-                onChange={(e) => setRememberMe(e.target.checked)}
-              />
-              <span>Mantener sesión iniciada (2 meses)</span>
-            </label>
-
-            <button type="submit" className="btn btn-primary btn-block">
-              <Lock size={16} style={{ marginRight: '8px' }} />
-              Iniciar Sesión
-            </button>
-
-            <button
-              type="button"
-              className="btn-link"
-              onClick={() => setLoginView('recover')}
+          <h2 style={{ fontSize: '28px', fontWeight: 'bold', margin: '0 0 16px 0', color: '#f8fafc' }}>
+            Cuenta en Proceso de Alta
+          </h2>
+          
+          <p style={{ color: '#94a3b8', fontSize: '15px', marginBottom: '32px', lineHeight: '1.6' }}>
+            Estamos configurando tu infraestructura de almacenamiento en la nube y asignando tus recursos de procesamiento. 
+            Una vez que nuestro equipo asigne tu bucket, la aplicación se desbloqueará automáticamente.
+          </p>
+          
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            <button 
+              onClick={() => supabase.auth.getSession().then(({ data }) => data.session && handleLoginSuccess(data.session))} 
               style={{
-                margin: '0 auto',
-                display: 'block',
-                fontSize: '12px',
-                color: 'var(--color-text-secondary)',
-                textDecoration: 'underline',
-                cursor: 'pointer'
+                width: '100%', backgroundColor: '#3b82f6', color: 'white', padding: '14px', borderRadius: '12px',
+                fontSize: '15px', fontWeight: '600', border: 'none', cursor: 'pointer', transition: 'background 0.2s'
               }}
+              onMouseOver={(e) => (e.currentTarget.style.backgroundColor = '#2563eb')}
+              onMouseOut={(e) => (e.currentTarget.style.backgroundColor = '#3b82f6')}
             >
-              ¿Olvidaste tu contraseña?
+              Verificar Estado Ahora
             </button>
-          </form>
+            <button 
+              onClick={handleLogout} 
+              style={{
+                width: '100%', backgroundColor: 'transparent', color: '#94a3b8', padding: '14px', borderRadius: '12px',
+                fontSize: '15px', fontWeight: '600', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer', transition: 'all 0.2s'
+              }}
+              onMouseOver={(e) => { e.currentTarget.style.color = 'white'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.3)' }}
+              onMouseOut={(e) => { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)' }}
+            >
+              Cerrar Sesión
+            </button>
+          </div>
         </div>
       </div>
     )
@@ -1015,14 +1115,14 @@ function App(): React.JSX.Element {
                 title="Desplegar menú"
                 style={{ padding: '0', background: 'transparent', boxShadow: 'none' }}
               >
-                <img src={logoPng} alt="PadelView Logo" style={{ width: '32px', height: '32px', objectFit: 'contain', marginLeft: '2px', filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))' }} />
+                <img src={logoPng} alt="ViewPadel Logo" style={{ width: '32px', height: '32px', objectFit: 'contain', marginLeft: '2px', filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))' }} />
                 <span className="logo-chevron-icon">
                   <ChevronRight size={20} />
                 </span>
               </button>
             ) : (
               <div className="brand-logo-static" style={{ background: 'transparent', boxShadow: 'none' }}>
-                <img src={logoPng} alt="PadelView Logo" style={{ width: '36px', height: '36px', objectFit: 'contain', filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))' }} />
+                <img src={logoPng} alt="ViewPadel Logo" style={{ width: '36px', height: '36px', objectFit: 'contain', filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))' }} />
               </div>
             )}
 
@@ -1031,7 +1131,7 @@ function App(): React.JSX.Element {
                 className="brand-title"
                 style={{ margin: 0, fontSize: '16px', fontWeight: 'bold' }}
               >
-                PadelView
+                ViewPadel
               </h2>
               <span className="badge" style={{ fontSize: '10px', marginTop: '2px', marginLeft: 0 }}>
                 MVP
@@ -1124,9 +1224,9 @@ function App(): React.JSX.Element {
               {activeTab === 'config' && 'Ajustes del Sistema'}
               {activeTab === 'profile' && 'Perfil de Usuario'}
             </h1>
-            <p className="text-secondary">
-              {clubName} - {loginOperator}
-            </p>
+            <div className="header-subtitle">
+              {clubName} - {profileName}
+            </div>
           </div>
           <button className="btn btn-secondary btn-icon" onClick={fetchData} disabled={loadingDb}>
             <RefreshCw size={16} className={loadingDb ? 'spin' : ''} />
@@ -2326,7 +2426,7 @@ function App(): React.JSX.Element {
                       <span>Lanzar aplicación al encender el equipo</span>
                     </label>
                     <span className="input-hint" style={{ marginTop: '4px', display: 'block' }}>
-                      PadelView se abrirá automáticamente en segundo plano cuando inicie Windows.
+                      ViewPadel se abrirá automáticamente en segundo plano cuando inicie Windows.
                     </span>
                   </div>
 
@@ -2470,22 +2570,22 @@ function App(): React.JSX.Element {
                 <div className="subscription-section">
                   <h3 className="section-title">Estado de Suscripción</h3>
 
-                  {subType === 'lifetime' && (
+                  {subType === 'vitalicia' && (
                     <div className="sub-card sub-vitalicia">
                       <h4>Suscripción Premium</h4>
                       <h3>Licencia Vitalicia</h3>
                       <p>
-                        ¡Muchas gracias por apoyar el proyecto PadelView! Tu club tiene todos los
+                        ¡Muchas gracias por apoyar el proyecto ViewPadel! Tu club tiene todos los
                         privilegios desbloqueados de forma indefinida.
                       </p>
                       <span className="sub-badge-gold">VITALICIA</span>
                     </div>
                   )}
 
-                  {subType === 'active' && (
+                  {(subType === 'pro' || subType === 'elite') && (
                     <div className="sub-card sub-activa">
                       <h4>Suscripción Premium</h4>
-                      <h3>Licencia Activa</h3>
+                      <h3>Plan {subType.toUpperCase()}</h3>
                       <p>
                         Suscripción registrada correctamente. Tu licencia expira el:{' '}
                         <strong>{subExpiry}</strong>.
@@ -2494,57 +2594,23 @@ function App(): React.JSX.Element {
                     </div>
                   )}
 
-                  {subType === 'inactive' && (
+                  {subType === 'free' && (
                     <div className="sub-card sub-inactiva">
-                      <h4>Licencia Expirada</h4>
-                      <h3>Sin Suscripción Activa</h3>
+                      <h4>Suscripción Gratuita</h4>
+                      <h3>Plan FREE</h3>
                       <p>
-                        No tienes ninguna suscripción activa para este club. Los videos no se
-                        procesarán ni subirán a la nube.
+                        Estás en el plan gratuito. Las funciones de grabación en la nube y monetización
+                        pueden estar limitadas.
                       </p>
                       <button
                         type="button"
                         className="btn btn-primary btn-sm"
                         onClick={() => window.open('https://padelview.app/subscribe', '_blank')}
                       >
-                        Dar de Alta Suscripción
+                        Mejorar Plan
                       </button>
                     </div>
                   )}
-
-                  {/* Simple simulated selector for demo purposes */}
-                  <div
-                    style={{
-                      marginTop: '16px',
-                      display: 'flex',
-                      gap: '10px',
-                      alignItems: 'center'
-                    }}
-                  >
-                    <span className="text-secondary text-xs">Simular estado (Evolutivo):</span>
-                    <select
-                      className="table-input"
-                      style={{ width: '130px', fontSize: '11px', padding: '4px' }}
-                      value={subType}
-                      onChange={(e) => {
-                        setSubType(e.target.value as any)
-                        // Trigger immediate persistence save
-                        const settings = {
-                          profileName,
-                          profileAvatar,
-                          clubName,
-                          clubRole,
-                          subType: e.target.value,
-                          subExpiry
-                        }
-                        localStorage.setItem('profileSettings', JSON.stringify(settings))
-                      }}
-                    >
-                      <option value="lifetime">Vitalicia</option>
-                      <option value="active">Activa</option>
-                      <option value="inactive">No Activa</option>
-                    </select>
-                  </div>
                 </div>
               </form>
             </div>

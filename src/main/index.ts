@@ -1,10 +1,24 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
-import { join } from 'path'
+import { join, resolve } from 'path'
 import fs from 'fs'
 import { spawn, ChildProcess } from 'child_process'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
 import icon from '../../resources/icon.png?asset'
+
+// Custom protocol registration for OAuth
+if (process.defaultApp) {
+  if (process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient('viewpadel', process.execPath, [resolve(process.argv[1])])
+  }
+} else {
+  app.setAsDefaultProtocolClient('viewpadel')
+}
+
+const gotTheLock = app.requestSingleInstanceLock()
+if (!gotTheLock) {
+  app.quit()
+}
 
 // Services imports
 import { vaultService } from './services/vault.service'
@@ -21,7 +35,7 @@ function createWindow(): void {
     height: 768,
     show: false,
     autoHideMenuBar: true,
-    title: 'PadelView - Control de Canchas y Grabación',
+    title: 'ViewPadel',
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -56,6 +70,18 @@ function createWindow(): void {
 
 // Register IPC handlers for renderer communication
 function registerIpcHandlers(): void {
+  // Auth external open
+  ipcMain.handle('auth:open-url', (_, url: string) => {
+    shell.openExternal(url)
+    return { success: true }
+  })
+
+  // Set Auth Token for DB Service
+  ipcMain.handle('session:set-token', (_, token: string | null) => {
+    dbService.setAccessToken(token)
+    return { success: true }
+  })
+
   // 1. Config management
   ipcMain.handle('config:get', () => {
     return {
@@ -80,6 +106,15 @@ function registerIpcHandlers(): void {
     } catch (error) {
       console.error('Failed to save config:', error)
       return { success: false, error: (error as Error).message }
+    }
+  })
+
+  // Window title update
+  ipcMain.on('window:set-title', (event, title: string) => {
+    const webContents = event.sender
+    const win = BrowserWindow.fromWebContents(webContents)
+    if (win) {
+      win.setTitle(title)
     }
   })
 
@@ -172,12 +207,12 @@ function registerIpcHandlers(): void {
     }
   })
 
-  ipcMain.handle('db:create-court', async (_, name: string, rtspUrlKey: string) => {
+  ipcMain.handle('db:create-court', async (_, name: string, rtspUrlKey: string, profileId: string) => {
     try {
       const db = dbService.getClient()
       const { data, error } = await db
         .from('courts')
-        .insert([{ name, rtsp_url_key: rtspUrlKey }])
+        .insert([{ name, rtsp_url_key: rtspUrlKey, profile_id: profileId }])
         .select()
       if (error) throw error
       return { success: true, data }
@@ -232,7 +267,8 @@ function registerIpcHandlers(): void {
         end_time: string
         player_name: string
         player_phone: string
-      }
+      },
+      profileId: string
     ) => {
       try {
         const db = dbService.getClient()
@@ -245,7 +281,8 @@ function registerIpcHandlers(): void {
               end_time: match.end_time,
               player_name: match.player_name,
               player_phone: match.player_phone,
-              status: 'SCHEDULED'
+              status: 'SCHEDULED',
+              profile_id: profileId
             }
           ])
           .select()
@@ -448,6 +485,28 @@ function registerIpcHandlers(): void {
 app.whenReady().then(() => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
+
+  // Listen for second instance (deep linking on Windows/Linux)
+  app.on('second-instance', (_, commandLine) => {
+    const mainWindow = BrowserWindow.getAllWindows()[0]
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
+    const url = commandLine.pop()
+    if (url && url.startsWith('viewpadel://')) {
+      mainWindow?.webContents.send('auth:deep-link', url)
+    }
+  })
+
+  // Listen for deep linking on macOS
+  app.on('open-url', (event, url) => {
+    event.preventDefault()
+    const mainWindow = BrowserWindow.getAllWindows()[0]
+    if (mainWindow) {
+      mainWindow.webContents.send('auth:deep-link', url)
+    }
+  })
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.

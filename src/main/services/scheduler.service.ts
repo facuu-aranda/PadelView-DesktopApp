@@ -22,6 +22,7 @@ class SchedulerService {
   private timer: NodeJS.Timeout | null = null
   private isProcessing = false
   private tempDir: string
+  private lastCleanupTime: number = 0
 
   constructor() {
     this.tempDir = path.join(app.getPath('userData'), 'temp_recordings')
@@ -122,6 +123,20 @@ class SchedulerService {
           this.notifyUI('match-updated', match.id)
         }
       }
+
+      // 2. Perform periodic cleanup of old videos (once every 6 hours)
+      if (now.getTime() - this.lastCleanupTime > 6 * 60 * 60 * 1000) {
+        this.lastCleanupTime = now.getTime()
+        const retentionDaysStr = vaultService.getSecret('VIDEO_RETENTION_DAYS') || '30'
+        const retentionDays = parseInt(retentionDaysStr, 10)
+        
+        if (retentionDays > 0) {
+          r2Service.deleteOldVideos(retentionDays).catch(err => {
+            console.error('Error during auto-cleanup of old videos:', err)
+          })
+        }
+      }
+      
     } catch (err) {
       console.error('Error during scheduler tick:', err)
     } finally {
