@@ -1,16 +1,18 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron';
-import { join } from 'path';
-import fs from 'fs';
-import { spawn, ChildProcess } from 'child_process';
-import { electronApp, optimizer, is } from '@electron-toolkit/utils';
-import icon from '../../resources/icon.png?asset';
+import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { join } from 'path'
+import fs from 'fs'
+import { spawn, ChildProcess } from 'child_process'
+import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { autoUpdater } from 'electron-updater'
+import icon from '../../resources/icon.png?asset'
 
 // Services imports
-import { vaultService } from './services/vault.service';
-import { dbService } from './services/db.service';
-import { ffmpegService } from './services/ffmpeg.service';
-import { r2Service } from './services/r2.service';
-import { schedulerService } from './services/scheduler.service';
+import { vaultService } from './services/vault.service'
+import { dbService } from './services/db.service'
+import { ffmpegService } from './services/ffmpeg.service'
+import { r2Service } from './services/r2.service'
+import { schedulerService } from './services/scheduler.service'
+import { discoveryService } from './services/discovery.service'
 
 function createWindow(): void {
   // Create the browser window.
@@ -25,30 +27,30 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false
     }
-  });
+  })
 
   mainWindow.on('ready-to-show', () => {
-    mainWindow.show();
-  });
+    mainWindow.show()
+  })
 
   // Redirect renderer logs to main console for diagnostics
   mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
     // Keep it clean: extract only the filename from the sourceId URL
-    const file = sourceId ? sourceId.split('/').pop() : 'unknown';
-    console.log(`[Renderer] [Lvl ${level}] ${message} (${file}:${line})`);
-  });
+    const file = sourceId ? sourceId.split('/').pop() : 'unknown'
+    console.log(`[Renderer] [Lvl ${level}] ${message} (${file}:${line})`)
+  })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url);
-    return { action: 'deny' };
-  });
+    shell.openExternal(details.url)
+    return { action: 'deny' }
+  })
 
   // HMR for renderer base on electron-vite cli.
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL']);
+    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
+    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -63,354 +65,447 @@ function registerIpcHandlers(): void {
       R2_ACCESS_KEY_ID: vaultService.getSecret('R2_ACCESS_KEY_ID') || '',
       R2_SECRET_ACCESS_KEY: vaultService.getSecret('R2_SECRET_ACCESS_KEY') || '',
       R2_ENDPOINT: vaultService.getSecret('R2_ENDPOINT') || '',
-      R2_BUCKET_NAME: vaultService.getSecret('R2_BUCKET_NAME') || 'padelview-matches',
-    };
-  });
+      R2_BUCKET_NAME: vaultService.getSecret('R2_BUCKET_NAME') || 'padelview-matches'
+    }
+  })
 
   ipcMain.handle('config:save', (_, config: Record<string, string>) => {
     try {
       for (const [key, value] of Object.entries(config)) {
-        vaultService.setSecret(key, value);
+        vaultService.setSecret(key, value)
       }
       // Reset db service client so it re-initializes with the new credentials next time it's used
-      dbService.resetClient();
-      return { success: true };
+      dbService.resetClient()
+      return { success: true }
     } catch (error) {
-      console.error('Failed to save config:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('Failed to save config:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   // Court specific RTSP URLs
   ipcMain.handle('config:get-rtsp', (_, courtId: string) => {
-    return vaultService.getSecret(`RTSP_URL_${courtId}`) || '';
-  });
+    return vaultService.getSecret(`RTSP_URL_${courtId}`) || ''
+  })
 
   ipcMain.handle('config:save-rtsp', (_, courtId: string, url: string) => {
     try {
-      vaultService.setSecret(`RTSP_URL_${courtId}`, url);
-      return { success: true };
+      vaultService.setSecret(`RTSP_URL_${courtId}`, url)
+      return { success: true }
     } catch (error) {
-      return { success: false, error: (error as Error).message };
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
+
+  // Get signed video URL from R2
+  ipcMain.handle('config:get-signed-url', async (_, key: string, forDownload?: boolean) => {
+    try {
+      const url = await r2Service.getSignedVideoUrl(key, 3600, forDownload)
+      return { success: true, url }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  // Get bucket usage
+  ipcMain.handle('config:get-bucket-usage', async () => {
+    try {
+      const usageBytes = await r2Service.getBucketUsage()
+      return { success: true, usageBytes }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
 
   // 2. FFmpeg check
   ipcMain.handle('ffmpeg:check', () => {
-    const ffmpegPath = ffmpegService.getFFmpegPath();
-    const exists = fs.existsSync(ffmpegPath);
+    const ffmpegPath = ffmpegService.getFFmpegPath()
+    const exists = fs.existsSync(ffmpegPath)
     return {
       path: ffmpegPath,
       exists: exists
-    };
-  });
+    }
+  })
 
   // 3. Manual action to terminate a recording
   ipcMain.handle('recordings:kill', (_, matchId: string) => {
-    const success = ffmpegService.killRecording(matchId);
-    return { success };
-  });
+    const success = ffmpegService.killRecording(matchId)
+    return { success }
+  })
 
   // 4. Manual action to terminate an upload
   ipcMain.handle('uploads:cancel', async (_, matchId: string) => {
-    const success = await r2Service.cancelUpload(matchId);
-    return { success };
-  });
+    const success = await r2Service.cancelUpload(matchId)
+    return { success }
+  })
 
   // 5. Get current scheduler & active states
   ipcMain.handle('scheduler:state', () => {
     return {
-      activeRecordingsCount: ffmpegService.getActiveCount(),
-    };
-  });
+      activeRecordingsCount: ffmpegService.getActiveCount()
+    }
+  })
+
+  // 5b. Local network scan for cameras
+  ipcMain.handle('network:scan-cameras', async (event) => {
+    try {
+      const foundIPs = await discoveryService.scanNetwork((percent, currentFound) => {
+        event.sender.send('network:scan-progress', { percent, foundIPs: currentFound })
+      })
+      return { success: true, foundIPs }
+    } catch (error) {
+      console.error('network:scan-cameras error:', error)
+      return { success: false, error: (error as Error).message }
+    }
+  })
 
   // 6. DB operations routed from frontend to protect credentials and use service key
   ipcMain.handle('db:get-courts', async () => {
     try {
-      const db = dbService.getClient();
-      const { data, error } = await db.from('courts').select('*').order('name', { ascending: true });
-      if (error) throw error;
-      return { success: true, data };
+      const db = dbService.getClient()
+      const { data, error } = await db.from('courts').select('*').order('name', { ascending: true })
+      if (error) throw error
+      return { success: true, data }
     } catch (error) {
-      console.error('db:get-courts error:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('db:get-courts error:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   ipcMain.handle('db:create-court', async (_, name: string, rtspUrlKey: string) => {
     try {
-      const db = dbService.getClient();
-      const { data, error } = await db.from('courts').insert([{ name, rtsp_url_key: rtspUrlKey }]).select();
-      if (error) throw error;
-      return { success: true, data };
+      const db = dbService.getClient()
+      const { data, error } = await db
+        .from('courts')
+        .insert([{ name, rtsp_url_key: rtspUrlKey }])
+        .select()
+      if (error) throw error
+      return { success: true, data }
     } catch (error) {
-      console.error('db:create-court error:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('db:create-court error:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
+
+  ipcMain.handle('db:delete-court', async (_, courtId: string) => {
+    try {
+      const db = dbService.getClient()
+      const { data, error } = await db.from('courts').delete().eq('id', courtId).select()
+      if (error) throw error
+
+      // Clean up the local RTSP URL secret associated with this court
+      vaultService.deleteSecret(`RTSP_URL_${courtId}`)
+
+      return { success: true, data }
+    } catch (error) {
+      console.error('db:delete-court error:', error)
+      return { success: false, error: (error as Error).message }
+    }
+  })
 
   ipcMain.handle('db:get-matches', async () => {
     try {
-      const db = dbService.getClient();
+      const db = dbService.getClient()
       // Fetch matches from today onwards
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
       const { data, error } = await db
         .from('matches')
         .select('*, courts(name)')
         .gte('start_time', today.toISOString())
-        .order('start_time', { ascending: true });
-      if (error) throw error;
-      return { success: true, data };
+        .order('start_time', { ascending: true })
+      if (error) throw error
+      return { success: true, data }
     } catch (error) {
-      console.error('db:get-matches error:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('db:get-matches error:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
-  ipcMain.handle('db:create-match', async (_, match: {
-    court_id: string;
-    start_time: string;
-    end_time: string;
-    player_name: string;
-    player_phone: string;
-  }) => {
-    try {
-      const db = dbService.getClient();
-      const { data, error } = await db
-        .from('matches')
-        .insert([{
-          court_id: match.court_id,
-          start_time: match.start_time,
-          end_time: match.end_time,
-          player_name: match.player_name,
-          player_phone: match.player_phone,
-          status: 'SCHEDULED'
-        }])
-        .select();
-      if (error) throw error;
-      return { success: true, data };
-    } catch (error) {
-      console.error('db:create-match error:', error);
-      return { success: false, error: (error as Error).message };
+  ipcMain.handle(
+    'db:create-match',
+    async (
+      _,
+      match: {
+        court_id: string
+        start_time: string
+        end_time: string
+        player_name: string
+        player_phone: string
+      }
+    ) => {
+      try {
+        const db = dbService.getClient()
+        const { data, error } = await db
+          .from('matches')
+          .insert([
+            {
+              court_id: match.court_id,
+              start_time: match.start_time,
+              end_time: match.end_time,
+              player_name: match.player_name,
+              player_phone: match.player_phone,
+              status: 'SCHEDULED'
+            }
+          ])
+          .select()
+        if (error) throw error
+        return { success: true, data }
+      } catch (error) {
+        console.error('db:create-match error:', error)
+        return { success: false, error: (error as Error).message }
+      }
     }
-  });
+  )
 
   ipcMain.handle('db:delete-match', async (_, matchId: string) => {
     try {
-      const db = dbService.getClient();
-      const { error } = await db.from('matches').delete().eq('id', matchId);
-      if (error) throw error;
-      return { success: true };
+      const db = dbService.getClient()
+      const { error } = await db.from('matches').delete().eq('id', matchId)
+      if (error) throw error
+      return { success: true }
     } catch (error) {
-      console.error('db:delete-match error:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('db:delete-match error:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   // 7. Auto-start on login configuration
   ipcMain.handle('config:get-startup', () => {
-    const settings = app.getLoginItemSettings();
-    return settings.openAtLogin;
-  });
+    const settings = app.getLoginItemSettings()
+    return settings.openAtLogin
+  })
 
   ipcMain.handle('config:save-startup', (_, enabled: boolean) => {
     try {
       app.setLoginItemSettings({
         openAtLogin: enabled,
         path: app.getPath('exe')
-      });
-      return { success: true };
+      })
+      return { success: true }
     } catch (error) {
-      console.error('Failed to set login item settings:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('Failed to set login item settings:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   // 8. Session management (persists for 2 months if rememberMe is selected)
   ipcMain.handle('session:get', () => {
-    const expiryStr = vaultService.getSecret('SESSION_EXPIRY');
-    if (!expiryStr) return { loggedIn: false };
-    
-    const expiry = new Date(expiryStr);
-    const now = new Date();
+    const expiryStr = vaultService.getSecret('SESSION_EXPIRY')
+    if (!expiryStr) return { loggedIn: false }
+
+    const expiry = new Date(expiryStr)
+    const now = new Date()
     if (now > expiry) {
-      vaultService.deleteSecret('SESSION_EXPIRY');
-      vaultService.deleteSecret('SESSION_OPERATOR');
-      return { loggedIn: false };
+      vaultService.deleteSecret('SESSION_EXPIRY')
+      vaultService.deleteSecret('SESSION_OPERATOR')
+      return { loggedIn: false }
     }
-    
-    return { 
-      loggedIn: true, 
+
+    return {
+      loggedIn: true,
       operatorName: vaultService.getSecret('SESSION_OPERATOR') || 'Administrador',
       expiry: expiryStr
-    };
-  });
+    }
+  })
 
   ipcMain.handle('session:save', (_, operatorName: string, rememberMe: boolean) => {
     try {
-      const expiry = new Date();
+      const expiry = new Date()
       if (rememberMe) {
         // 2 months duration
-        expiry.setMonth(expiry.getMonth() + 2);
+        expiry.setMonth(expiry.getMonth() + 2)
       } else {
         // 12 hours temporary session
-        expiry.setHours(expiry.getHours() + 12);
+        expiry.setHours(expiry.getHours() + 12)
       }
-      vaultService.setSecret('SESSION_EXPIRY', expiry.toISOString());
-      vaultService.setSecret('SESSION_OPERATOR', operatorName);
-      return { success: true };
+      vaultService.setSecret('SESSION_EXPIRY', expiry.toISOString())
+      vaultService.setSecret('SESSION_OPERATOR', operatorName)
+      return { success: true }
     } catch (error) {
-      console.error('Failed to save session:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('Failed to save session:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   ipcMain.handle('session:clear', () => {
     try {
-      vaultService.deleteSecret('SESSION_EXPIRY');
-      vaultService.deleteSecret('SESSION_OPERATOR');
-      return { success: true };
+      vaultService.deleteSecret('SESSION_EXPIRY')
+      vaultService.deleteSecret('SESSION_OPERATOR')
+      return { success: true }
     } catch (error) {
-      console.error('Failed to clear session:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('Failed to clear session:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   // 9. Notifications configuration
   ipcMain.handle('config:get-notifications', () => {
-    return vaultService.getSecret('NOTIFICATIONS_ENABLED') !== 'false';
-  });
+    return vaultService.getSecret('NOTIFICATIONS_ENABLED') !== 'false'
+  })
 
   ipcMain.handle('config:save-notifications', (_, enabled: boolean) => {
     try {
-      vaultService.setSecret('NOTIFICATIONS_ENABLED', enabled ? 'true' : 'false');
-      return { success: true };
+      vaultService.setSecret('NOTIFICATIONS_ENABLED', enabled ? 'true' : 'false')
+      return { success: true }
     } catch (error) {
-      console.error('Failed to save notifications setting:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('Failed to save notifications setting:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   // 10. Native scale zoom configuration
   ipcMain.handle('config:set-zoom-factor', (event, factor: number) => {
     try {
-      const webContents = event.sender;
-      webContents.setZoomFactor(factor);
-      return { success: true };
+      const webContents = event.sender
+      webContents.setZoomFactor(factor)
+      return { success: true }
     } catch (error) {
-      console.error('Failed to set zoom factor:', error);
-      return { success: false, error: (error as Error).message };
+      console.error('Failed to set zoom factor:', error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   // 11. Live Camera Streaming handlers (RTSP -> JSMpeg / IPC)
   ipcMain.handle('stream:start', (event, { courtId, rtspUrl }) => {
-    console.log(`[IPC] stream:start requested for court ${courtId} with RTSP URL: ${rtspUrl}`);
+    console.log(`[IPC] stream:start requested for court ${courtId} with RTSP URL: ${rtspUrl}`)
     if (activeStreams.has(courtId)) {
-      console.log(`[IPC] Stream for court ${courtId} is already active.`);
-      return { success: true, message: 'Stream already active' };
+      console.log(`[IPC] Stream for court ${courtId} is already active.`)
+      return { success: true, message: 'Stream already active' }
     }
 
     try {
-      const ffmpegPath = ffmpegService.getFFmpegPath();
+      const ffmpegPath = ffmpegService.getFFmpegPath()
       const args = [
-        '-rtsp_transport', 'tcp',
-        '-i', rtspUrl,
-        '-f', 'mpegts',
-        '-codec:v', 'mpeg1video',
-        '-s', '640x360',
-        '-b:v', '800k',
-        '-r', '25',
-        '-bf', '0',
+        '-rtsp_transport',
+        'tcp',
+        '-i',
+        rtspUrl,
+        '-f',
+        'mpegts',
+        '-codec:v',
+        'mpeg1video',
+        '-s',
+        '640x360',
+        '-b:v',
+        '800k',
+        '-r',
+        '25',
+        '-bf',
+        '0',
         '-'
-      ];
+      ]
 
-      console.log(`[IPC] Spawning FFmpeg stream process: ${ffmpegPath} ${args.join(' ')}`);
-      const proc = spawn(ffmpegPath, args);
-      activeStreams.set(courtId, proc);
+      console.log(`[IPC] Spawning FFmpeg stream process: ${ffmpegPath} ${args.join(' ')}`)
+      const proc = spawn(ffmpegPath, args)
+      activeStreams.set(courtId, proc)
 
-      const webContents = event.sender;
-      let chunkCount = 0;
+      const webContents = event.sender
+      let chunkCount = 0
 
       proc.stdout.on('data', (data: Buffer) => {
-        chunkCount++;
+        chunkCount++
         if (chunkCount <= 5 || chunkCount % 100 === 0) {
-          console.log(`[IPC] stream for court ${courtId}: sent chunk #${chunkCount} (size: ${data.length} bytes)`);
+          console.log(
+            `[IPC] stream for court ${courtId}: sent chunk #${chunkCount} (size: ${data.length} bytes)`
+          )
         }
         if (!webContents.isDestroyed()) {
-          webContents.send(`stream:data:${courtId}`, data);
+          webContents.send(`stream:data:${courtId}`, data)
         }
-      });
+      })
 
       proc.stderr.on('data', (data) => {
         // Keep a log of FFmpeg stderr to debug connection or codec issues
-        console.log(`[FFmpeg Stream ${courtId} Stderr]:`, data.toString().trim());
-      });
+        console.log(`[FFmpeg Stream ${courtId} Stderr]:`, data.toString().trim())
+      })
 
       proc.on('close', (code) => {
-        console.log(`[IPC] FFmpeg Stream process for court ${courtId} closed with exit code ${code}`);
-        activeStreams.delete(courtId);
-      });
+        console.log(
+          `[IPC] FFmpeg Stream process for court ${courtId} closed with exit code ${code}`
+        )
+        activeStreams.delete(courtId)
+      })
 
-      return { success: true };
+      return { success: true }
     } catch (error) {
-      console.error(`[IPC] Failed to start streaming for court ${courtId}:`, error);
-      return { success: false, error: (error as Error).message };
+      console.error(`[IPC] Failed to start streaming for court ${courtId}:`, error)
+      return { success: false, error: (error as Error).message }
     }
-  });
+  })
 
   ipcMain.handle('stream:stop', (_, courtId) => {
-    const proc = activeStreams.get(courtId);
+    const proc = activeStreams.get(courtId)
     if (proc) {
-      proc.kill('SIGKILL');
-      activeStreams.delete(courtId);
-      return { success: true };
+      proc.kill('SIGKILL')
+      activeStreams.delete(courtId)
+      return { success: true }
     }
-    return { success: false, error: 'No stream active' };
-  });
+    return { success: false, error: 'No stream active' }
+  })
 }
 
 app.whenReady().then(() => {
   // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron');
+  electronApp.setAppUserModelId('com.electron')
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
   app.on('browser-window-created', (_, window) => {
-    optimizer.watchWindowShortcuts(window);
-  });
+    optimizer.watchWindowShortcuts(window)
+  })
 
   // Setup IPC
-  registerIpcHandlers();
+  registerIpcHandlers()
 
   // Create UI window
-  createWindow();
+  createWindow()
 
   // Start background scheduler service
-  schedulerService.start();
+  schedulerService.start()
 
   app.on('activate', function () {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
-});
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  })
 
-const activeStreams = new Map<string, ChildProcess>();
+  // Configure and check for updates
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = true
+  
+  if (is.dev) {
+    // Optionally mock autoUpdater in dev if needed, or disable
+    autoUpdater.logger = console
+  } else {
+    autoUpdater.checkForUpdatesAndNotify()
+  }
+
+  autoUpdater.on('update-available', () => {
+    console.log('Update available, downloading...')
+    autoUpdater.downloadUpdate()
+  })
+
+  autoUpdater.on('update-downloaded', () => {
+    console.log('Update downloaded, it will be installed on restart')
+    // We could notify the renderer here to show a toast
+  })
+})
+
+const activeStreams = new Map<string, ChildProcess>()
 
 app.on('window-all-closed', () => {
   // Kill all live streaming processes
   for (const [courtId, proc] of activeStreams.entries()) {
     try {
-      proc.kill('SIGKILL');
-      console.log(`Terminated stream process for court ${courtId} on close.`);
+      proc.kill('SIGKILL')
+      console.log(`Terminated stream process for court ${courtId} on close.`)
     } catch (err) {
-      console.error(`Error killing stream process:`, err);
+      console.error(`Error killing stream process:`, err)
     }
   }
-  activeStreams.clear();
+  activeStreams.clear()
 
   if (process.platform !== 'darwin') {
-    schedulerService.stop();
-    app.quit();
+    schedulerService.stop()
+    app.quit()
   }
-});
+})

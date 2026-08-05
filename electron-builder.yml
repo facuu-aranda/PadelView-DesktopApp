@@ -1,5 +1,5 @@
-appId: com.electron.app
-productName: '-'
+appId: com.viewpadel.desktop
+productName: 'ViewPadel'
 directories:
   buildResources: build
 files:
@@ -12,9 +12,9 @@ files:
 asarUnpack:
   - resources/**
 win:
-  executableName: '-'
+  executableName: 'ViewPadel'
 nsis:
-  artifactName: ${name}-${version}-setup.${ext}
+  artifactName: ViewPadel-Setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
@@ -39,5 +39,6 @@ appImage:
   artifactName: ${name}-${version}.${ext}
 npmRebuild: false
 publish:
-  provider: generic
-  url: https://example.com/auto-updates
+  provider: github
+  owner: facuu-aranda
+  repo: PadelView-DesktopApp
