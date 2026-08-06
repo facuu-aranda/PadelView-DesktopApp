@@ -39,7 +39,8 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false
+      sandbox: false,
+      webSecurity: false // Disabled to allow HTML5 video player to load R2 streams without CORS restrictions
     }
   })
 
@@ -241,6 +242,27 @@ function registerIpcHandlers(): void {
   ipcMain.handle('db:delete-court', async (_, courtId: string) => {
     try {
       const db = dbService.getClient()
+      
+      // Before deleting the court, find all matches associated with it that have videos in R2
+      const { data: matches } = await db
+        .from('matches')
+        .select('video_key')
+        .eq('court_id', courtId)
+        .not('video_key', 'is', null)
+
+      // Delete the orphaned videos from R2 to prevent them from taking up space
+      if (matches && matches.length > 0) {
+        console.log(`Found ${matches.length} matches with videos to delete from R2 before court deletion.`)
+        for (const match of matches) {
+          if (match.video_key) {
+            await r2Service.deleteVideo(match.video_key).catch(err => 
+              console.error(`Failed to cleanup video ${match.video_key} for court deletion:`, err)
+            )
+          }
+        }
+      }
+
+      // Now it's safe to let Postgres ON DELETE CASCADE remove the match records
       const { data, error } = await db.from('courts').delete().eq('id', courtId).select()
       if (error) throw error
 
