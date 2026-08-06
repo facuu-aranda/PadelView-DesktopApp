@@ -183,6 +183,44 @@ class R2Service {
     }
   }
 
+  public async listAllVideos(): Promise<{ key: string; size: number; lastModified: Date }[]> {
+    try {
+      const { client, bucket } = this.getS3Client()
+      const videos: { key: string; size: number; lastModified: Date }[] = []
+      let isTruncated = true
+      let continuationToken: string | undefined = undefined
+
+      while (isTruncated) {
+        const command = new ListObjectsV2Command({
+          Bucket: bucket,
+          ContinuationToken: continuationToken
+        })
+        const response = (await client.send(command)) as ListObjectsV2CommandOutput
+        
+        if (response.Contents) {
+          for (const obj of response.Contents) {
+            if (obj.Key && obj.Key.endsWith('.mp4')) {
+              videos.push({
+                key: obj.Key,
+                size: obj.Size || 0,
+                lastModified: obj.LastModified ? new Date(obj.LastModified) : new Date()
+              })
+            }
+          }
+        }
+        
+        isTruncated = response.IsTruncated ?? false
+        continuationToken = response.NextContinuationToken
+      }
+      
+      // Sort by newest first
+      return videos.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime())
+    } catch (error) {
+      console.error('Failed to list videos from R2:', error)
+      throw error
+    }
+  }
+
   public async deleteOldVideos(retentionDays: number): Promise<void> {
     try {
       const { client, bucket } = this.getS3Client()

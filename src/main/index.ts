@@ -143,6 +143,31 @@ function registerIpcHandlers(): void {
     }
   })
 
+  // List all videos directly from R2
+  ipcMain.handle('r2:list-videos', async () => {
+    try {
+      const videos = await r2Service.listAllVideos()
+      return { success: true, videos }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  // Delete video directly from R2 (and try DB just in case)
+  ipcMain.handle('r2:delete-video', async (_, key: string) => {
+    try {
+      await r2Service.deleteVideo(key)
+      // Attempt to clean up DB record if it exists (no error if it doesn't)
+      try {
+        const db = dbService.getClient()
+        await db.from('matches').delete().eq('video_key', key)
+      } catch (e) { /* ignore */ }
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
   // Get bucket usage
   ipcMain.handle('config:get-bucket-usage', async () => {
     try {

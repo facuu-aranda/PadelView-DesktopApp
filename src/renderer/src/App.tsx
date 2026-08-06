@@ -315,6 +315,7 @@ function App(): React.JSX.Element {
   // Database States
   const [courts, setCourts] = useState<Court[]>([])
   const [matches, setMatches] = useState<Match[]>([])
+  const [r2Videos, setR2Videos] = useState<{ key: string; size: number; lastModified: Date }[]>([])
   const [loadingDb, setLoadingDb] = useState(false)
 
   // Active Process States (updated via IPC)
@@ -522,6 +523,49 @@ function App(): React.JSX.Element {
     }
   }
 
+  // Direct R2 handlers for Video Library
+  const handlePlayR2Video = async (key: string) => {
+    setPlayingVideoId(key)
+    setPlayingVideoUrl(null)
+    if (window.electron) {
+      const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', key)
+      if (res.success) {
+        setPlayingVideoUrl(res.url)
+      } else {
+        showToast('Error al obtener URL del video', 'error')
+        setPlayingVideoId(null)
+      }
+    }
+  }
+
+  const handleDownloadR2Video = async (key: string) => {
+    if (window.electron) {
+      const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', key, true)
+      if (res.success) {
+        const a = document.createElement('a')
+        a.href = res.url
+        a.download = ''
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        showToast('Iniciando descarga...', 'success')
+      } else {
+        showToast('Error al obtener URL del video', 'error')
+      }
+    }
+  }
+
+  const handleDeleteR2Video = async (key: string) => {
+    if (!confirm('¿Estás seguro de que deseas eliminar este video permanentemente?') || !window.electron) return
+    const res = await window.electron.ipcRenderer.invoke('r2:delete-video', key)
+    if (res.success) {
+      showToast('Video eliminado exitosamente.', 'success')
+      fetchData()
+    } else {
+      showToast(`Error: ${res.error}`, 'error')
+    }
+  }
+
   // Apply visual theme and zoom scaling to document element
   useEffect(() => {
     const root = document.documentElement
@@ -699,7 +743,16 @@ function App(): React.JSX.Element {
         const matchesRes = await window.electron.ipcRenderer.invoke('db:get-matches')
         if (matchesRes.success) {
           setMatches(matchesRes.data)
-          setConfigError(null)
+        } else {
+          console.error(matchesRes.error)
+        }
+
+        const r2Res = await window.electron.ipcRenderer.invoke('r2:list-videos')
+        if (r2Res.success) {
+          // ensure lastModified is parsed as Date if it comes as string over IPC
+          setR2Videos(r2Res.videos.map((v: any) => ({ ...v, lastModified: new Date(v.lastModified) })))
+        } else {
+          console.error(r2Res.error)
         }
       }
     } catch (err) {
@@ -1631,15 +1684,15 @@ function App(): React.JSX.Element {
                 </div>
 
                 <div className="videos-grid" style={{ marginTop: '20px' }}>
-                  {matches.filter(m => m.status === 'DONE').length === 0 ? (
+                  {r2Videos.length === 0 ? (
                     <div className="empty-state" style={{ gridColumn: '1 / -1' }}>
                       <Film size={48} className="text-muted" />
                       <p>No hay videos disponibles en el almacenamiento.</p>
                     </div>
                   ) : (
-                    matches.filter(m => m.status === 'DONE').map((match) => (
-                      <div key={match.id} className="video-card card-pane" style={{ padding: '0', overflow: 'hidden' }}>
-                        <div className="video-thumbnail" onClick={() => handlePlayVideo(match.id)}>
+                    r2Videos.map((video) => (
+                      <div key={video.key} className="video-card card-pane" style={{ padding: '0', overflow: 'hidden' }}>
+                        <div className="video-thumbnail" onClick={() => handlePlayR2Video(video.key)}>
                           <div className="video-thumbnail-overlay">
                             <Play size={40} className="play-icon" />
                           </div>
@@ -1649,22 +1702,21 @@ function App(): React.JSX.Element {
                           </div>
                         </div>
                         <div className="video-info" style={{ padding: '12px' }}>
-                          <h4 style={{ margin: '0 0 4px 0', fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{match.player_name}</h4>
+                          <h4 style={{ margin: '0 0 4px 0', fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {video.key.split('/').pop()}
+                          </h4>
                           <p className="text-muted text-xs" style={{ margin: '0 0 12px 0' }}>
-                            {new Date(match.start_time).toLocaleDateString()} - {new Date(match.start_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            {video.lastModified.toLocaleDateString()} - {video.lastModified.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {(video.size / (1024 * 1024)).toFixed(2)} MB
                           </p>
-                          <div className="video-actions" style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid var(--color-border)', paddingTop: '10px' }}>
+                          <div className="video-actions" style={{ display: 'flex', justifyContent: 'flex-end', borderTop: '1px solid var(--color-border)', paddingTop: '10px' }}>
                             <div style={{ display: 'flex', gap: '8px' }}>
-                              <button className="btn-icon" style={{ color: 'var(--color-primary)' }} onClick={() => setInfoVideoId(match.id)} title="Ver Información">
-                                <Info size={16} />
-                              </button>
-                              <button className="btn-icon" style={{ color: '#3b82f6' }} onClick={() => handleDownloadVideo(match.id)} title="Descargar Video">
+                              <button className="btn-icon" style={{ color: '#3b82f6' }} onClick={() => handleDownloadR2Video(video.key)} title="Descargar Video">
                                 <Download size={16} />
                               </button>
+                              <button className="btn-icon text-danger" onClick={() => handleDeleteR2Video(video.key)} title="Eliminar Video">
+                                <Trash2 size={16} />
+                              </button>
                             </div>
-                            <button className="btn-icon text-danger" onClick={() => handleDeleteMatch(match.id)} title="Eliminar Video">
-                              <Trash2 size={16} />
-                            </button>
                           </div>
                         </div>
                       </div>
