@@ -27,7 +27,7 @@ class R2Service {
   private getS3Client(): { client: S3Client; bucket: string } {
     const accessKeyId = vaultService.getSecret('R2_ACCESS_KEY_ID')
     const secretAccessKey = vaultService.getSecret('R2_SECRET_ACCESS_KEY')
-    const endpoint = vaultService.getSecret('R2_ENDPOINT')
+    const endpoint = (vaultService.getSecret('R2_ENDPOINT') || '').replace(/\/+$/, '').trim()
     const bucket = vaultService.getSecret('R2_BUCKET_NAME') || 'padelview-matches'
 
     if (!accessKeyId || !secretAccessKey || !endpoint) {
@@ -270,11 +270,17 @@ class R2Service {
   public async deleteVideo(key: string): Promise<void> {
     try {
       const { client, bucket } = this.getS3Client()
-      const command = new DeleteObjectCommand({
+      const command = new DeleteObjectsCommand({
         Bucket: bucket,
-        Key: key
+        Delete: {
+          Objects: [{ Key: key }],
+          Quiet: false
+        }
       })
-      await client.send(command)
+      const response = await client.send(command)
+      if (response.Errors && response.Errors.length > 0) {
+        throw new Error(`Cloudflare R2 Error: ${response.Errors[0].Message}`)
+      }
       console.log(`Deleted video from R2: ${key}`)
     } catch (error) {
       console.error(`Failed to delete video ${key} from R2:`, error)
