@@ -21,7 +21,6 @@ import {
   ChevronRight,
   MoreVertical,
   Film,
-  Info,
   Download
 } from 'lucide-react'
 import padelCourtSvg from './assets/PadelCourt.svg'
@@ -481,48 +480,6 @@ function App(): React.JSX.Element {
   }
 
   // Play video handler
-  const handlePlayVideo = async (matchId: string) => {
-    const match = matches.find((m) => m.id === matchId)
-    if (!match || !match.video_key) {
-      showToast('Este partido no tiene un video procesado aún.', 'warning')
-      return
-    }
-    setPlayingVideoId(matchId)
-    setPlayingVideoUrl(null)
-    if (window.electron) {
-      const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', match.video_key)
-      if (res.success) {
-        setPlayingVideoUrl(res.url)
-      } else {
-        showToast('Error al obtener URL del video', 'error')
-        setPlayingVideoId(null)
-      }
-    }
-  }
-
-  // Download video handler
-  const handleDownloadVideo = async (matchId: string) => {
-    const match = matches.find((m) => m.id === matchId)
-    if (!match || !match.video_key) {
-      showToast('Este partido no tiene un video procesado aún.', 'warning')
-      return
-    }
-    if (window.electron) {
-      const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', match.video_key, true)
-      if (res.success) {
-        const a = document.createElement('a')
-        a.href = res.url
-        a.download = ''
-        document.body.appendChild(a)
-        a.click()
-        a.remove()
-        showToast('Iniciando descarga...', 'success')
-      } else {
-        showToast('Error al obtener URL del video', 'error')
-      }
-    }
-  }
-
   // Direct R2 handlers for Video Library
   const handlePlayR2Video = async (key: string) => {
     setPlayingVideoId(key)
