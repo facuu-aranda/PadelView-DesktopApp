@@ -257,13 +257,19 @@ function registerIpcHandlers(): void {
   ipcMain.handle('db:get-matches', async () => {
     try {
       const db = dbService.getClient()
-      // Fetch matches from today onwards
-      const today = new Date()
-      today.setHours(0, 0, 0, 0)
+      // Fetch matches within the retention window (default 30 days)
+      // This ensures videos are visible in the library until they are auto-deleted.
+      const retentionDaysStr = vaultService.getSecret('VIDEO_RETENTION_DAYS') || '30'
+      const retentionDays = parseInt(retentionDaysStr, 10)
+      
+      const cutoff = new Date()
+      cutoff.setDate(cutoff.getDate() - (retentionDays > 0 ? retentionDays : 30))
+      cutoff.setHours(0, 0, 0, 0)
+
       const { data, error } = await db
         .from('matches')
         .select('*, courts(name)')
-        .gte('start_time', today.toISOString())
+        .gte('start_time', cutoff.toISOString())
         .order('start_time', { ascending: true })
       if (error) throw error
       return { success: true, data }

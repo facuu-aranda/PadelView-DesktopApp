@@ -1,4 +1,5 @@
 import { app, BrowserWindow, Notification } from 'electron'
+import icon from '../../../resources/icon.png?asset'
 import path from 'path'
 import fs from 'fs'
 import { dbService } from './db.service'
@@ -411,6 +412,7 @@ class SchedulerService {
       new Notification({
         title,
         body,
+        icon: icon,
         silent: false
       }).show()
     }
