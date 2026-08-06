@@ -73,7 +73,7 @@ export default function LoginScreen({ onLogin }: LoginScreenProps) {
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: 'viewpadel://login', // Matches Supabase redirect URI
+          redirectTo: 'https://padel-view-web-app.vercel.app/auth/desktop-callback', // Uses web portal as intermediate for deep linking
           skipBrowserRedirect: true // Don't replace current electron window
         }
       })
