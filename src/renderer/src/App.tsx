@@ -1683,8 +1683,7 @@ function App(): React.JSX.Element {
                     <h3 className="card-title" style={{ marginBottom: '16px' }}>Reproductor de Video</h3>
                     <div className="video-player-container" style={{ background: '#000', borderRadius: '8px', overflow: 'hidden', aspectRatio: '16/9', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                       {playingVideoUrl ? (
-                        <video controls autoPlay style={{ width: '100%', height: '100%', display: 'block' }}>
-                          <source src={playingVideoUrl} type="video/mp4" />
+                        <video key={playingVideoUrl} controls autoPlay src={playingVideoUrl} style={{ width: '100%', height: '100%', display: 'block' }}>
                           Tu navegador no soporta reproducción de video.
                         </video>
                       ) : (

@@ -1,4 +1,4 @@
-import { S3Client, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput, DeleteObjectsCommand } from '@aws-sdk/client-s3'
+import { S3Client, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput, DeleteObjectsCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { vaultService } from './vault.service'
@@ -226,6 +226,21 @@ class R2Service {
       }
     } catch (error) {
       console.error('Failed to delete old videos:', error)
+    }
+  }
+
+  public async deleteVideo(key: string): Promise<void> {
+    try {
+      const { client, bucket } = this.getS3Client()
+      const command = new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: key
+      })
+      await client.send(command)
+      console.log(`Deleted video from R2: ${key}`)
+    } catch (error) {
+      console.error(`Failed to delete video ${key} from R2:`, error)
+      throw error
     }
   }
 }

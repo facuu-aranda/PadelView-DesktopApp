@@ -145,8 +145,24 @@ function registerIpcHandlers(): void {
   // Get bucket usage
   ipcMain.handle('config:get-bucket-usage', async () => {
     try {
-      const usageBytes = await r2Service.getBucketUsage()
-      return { success: true, usageBytes }
+      const r2UsageBytes = await r2Service.getBucketUsage()
+      
+      // Calculate local recordings folder size
+      let localUsageBytes = 0
+      try {
+        const localRecordingsPath = join(app.getPath('userData'), 'temp_recordings')
+        if (fs.existsSync(localRecordingsPath)) {
+          const files = fs.readdirSync(localRecordingsPath)
+          for (const file of files) {
+            const stats = fs.statSync(join(localRecordingsPath, file))
+            localUsageBytes += stats.size
+          }
+        }
+      } catch (err) {
+        console.error('Error calculating local usage:', err)
+      }
+
+      return { success: true, usageBytes: r2UsageBytes + localUsageBytes }
     } catch (error) {
       return { success: false, error: (error as Error).message }
     }
@@ -298,6 +314,29 @@ function registerIpcHandlers(): void {
   ipcMain.handle('db:delete-match', async (_, matchId: string) => {
     try {
       const db = dbService.getClient()
+      
+      // Fetch match to get video_key
+      const { data: match } = await db.from('matches').select('video_key').eq('id', matchId).single()
+      
+      if (match?.video_key) {
+        try {
+          await r2Service.deleteVideo(match.video_key)
+        } catch (err) {
+          console.error(`Error deleting video from R2 for match ${matchId}:`, err)
+        }
+      }
+
+      // Delete local file if it exists
+      try {
+        const localPath = join(app.getPath('userData'), 'temp_recordings', `${matchId}.mp4`)
+        if (fs.existsSync(localPath)) {
+          fs.unlinkSync(localPath)
+          console.log(`Deleted local file: ${localPath}`)
+        }
+      } catch (err) {
+        console.error(`Error deleting local file for match ${matchId}:`, err)
+      }
+
       const { error } = await db.from('matches').delete().eq('id', matchId)
       if (error) throw error
       return { success: true }
@@ -484,7 +523,7 @@ function registerIpcHandlers(): void {
 
 app.whenReady().then(() => {
   // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron')
+  electronApp.setAppUserModelId('ViewPadel')
 
   // Listen for second instance (deep linking on Windows/Linux)
   app.on('second-instance', (_, commandLine) => {
