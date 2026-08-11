@@ -5,6 +5,10 @@ import { spawn, ChildProcess } from 'child_process'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { autoUpdater } from 'electron-updater'
 import icon from '../../resources/icon.png?asset'
+import log from 'electron-log/main'
+
+log.initialize()
+Object.assign(console, log.functions)
 
 // Custom protocol registration for OAuth
 if (process.defaultApp) {
@@ -571,6 +575,25 @@ function registerIpcHandlers(): void {
       return { success: true }
     }
     return { success: false, error: 'No stream active' }
+  })
+
+  // Logs viewer
+  ipcMain.handle('logs:view', () => {
+    try {
+      const logPath = log.transports.file.getFile().path
+      const logContent = fs.readFileSync(logPath, 'utf8')
+      const logWindow = new BrowserWindow({
+        width: 1000,
+        height: 700,
+        title: 'ViewPadel Logs',
+        autoHideMenuBar: true
+      })
+      logWindow.loadURL(`data:text/plain;charset=utf-8,${encodeURIComponent(logContent)}`)
+      return { success: true }
+    } catch (error) {
+      console.error('Failed to view logs:', error)
+      return { success: false, error: (error as Error).message }
+    }
   })
 }
 

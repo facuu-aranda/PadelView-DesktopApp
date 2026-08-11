@@ -20,9 +20,9 @@ class DbService {
     }
 
     // Use environment variables as fallback if vault is not configured
-    let supabaseUrl = vaultService.getSecret('SUPABASE_URL') || process.env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co'
+    let supabaseUrl = vaultService.getSecret('SUPABASE_URL') || (import.meta as any).env.VITE_SUPABASE_URL || 'https://placeholder.supabase.co'
     const supabaseKey =
-      vaultService.getSecret('SUPABASE_KEY') || process.env.VITE_SUPABASE_ANON_KEY || 'eyPlaceholder'
+      vaultService.getSecret('SUPABASE_KEY') || (import.meta as any).env.VITE_SUPABASE_ANON_KEY || 'eyPlaceholder'
 
     if (!supabaseUrl || !supabaseKey) {
       throw new Error(

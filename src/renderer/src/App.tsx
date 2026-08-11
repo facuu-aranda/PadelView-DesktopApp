@@ -271,6 +271,10 @@ function App(): React.JSX.Element {
     return localStorage.getItem('sidebarCollapsed') === 'true'
   })
 
+  // Logs Viewer State
+  const [showLogsModal, setShowLogsModal] = useState<boolean>(false)
+  const [logsPassword, setLogsPassword] = useState<string>('')
+
   // Login States
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false)
   const [isConfigured, setIsConfigured] = useState<boolean | null>(null)
@@ -927,16 +931,26 @@ function App(): React.JSX.Element {
 
   // Auto start toggle
   const handleToggleStartup = async (enabled: boolean) => {
-    if (!window.electron) return
-    const res = await window.electron.ipcRenderer.invoke('config:save-startup', enabled)
-    if (res.success) {
-      setLaunchOnStartup(enabled)
+    setLaunchOnStartup(enabled)
+    if (window.electron) {
+      await window.electron.ipcRenderer.invoke('config:save-startup', enabled)
       showToast(
-        enabled ? 'Inicio automático activado.' : 'Inicio automático desactivado.',
+        enabled ? 'Arranque automático activado.' : 'Arranque automático desactivado.',
         'success'
       )
+    }
+  }
+
+  const handleViewLogs = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (logsPassword === '1q2w3e4r!') {
+      setShowLogsModal(false)
+      setLogsPassword('')
+      if (window.electron) {
+        await window.electron.ipcRenderer.invoke('logs:view')
+      }
     } else {
-      showToast('No se pudo modificar la configuración de inicio.', 'error')
+      showToast('Contraseña incorrecta', 'error')
     }
   }
 
@@ -2105,10 +2119,34 @@ function App(): React.JSX.Element {
                         </div>
                       </div>
 
+                      <div className="form-group" style={{ marginTop: '16px' }}>
+                        <label>Previsualización de Cámara</label>
+                        <div style={{ marginTop: '8px' }}>
+                          {newCourt.rtsp_url ? (
+                            <LiveCourtStream courtId="preview-camera" rtspUrl={newCourt.rtsp_url} />
+                          ) : (
+                            <div
+                              style={{
+                                width: '100%',
+                                aspectRatio: '16/9',
+                                backgroundColor: 'rgba(0,0,0,0.2)',
+                                borderRadius: '12px',
+                                border: '1px dashed var(--color-border)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center'
+                              }}
+                            >
+                              <span className="text-muted text-sm">Ingresa una URL RTSP para previsualizar</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
                       <button
                         type="submit"
                         className="btn btn-primary btn-block"
-                        style={{ marginTop: '10px' }}
+                        style={{ marginTop: '16px' }}
                       >
                         Registrar Cancha
                       </button>
@@ -2190,6 +2228,20 @@ function App(): React.JSX.Element {
           {activeTab === 'config' && (
             <div className="config-view">
               <div className="config-form form-grid">
+                {/* System Logs Card */}
+                <div className="card-pane">
+                  <h3 className="card-title">Registros del Sistema</h3>
+                  <p className="text-muted text-sm" style={{ marginBottom: '16px' }}>
+                    Visualiza los registros internos de la aplicación para diagnóstico y solución de problemas.
+                  </p>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => setShowLogsModal(true)}
+                  >
+                    Ver Logs
+                  </button>
+                </div>
+
                 {/* Visual Settings & Themes Card */}
                 <div className="card-pane">
                   <h3 className="card-title">Ajustes Visuales</h3>
@@ -2624,6 +2676,38 @@ function App(): React.JSX.Element {
             </div>
           )}
         </div>
+
+        {/* Logs Password Modal */}
+        {showLogsModal && (
+          <div className="modal-overlay" onClick={() => setShowLogsModal(false)}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px' }}>
+              <h3 className="card-title">Acceso a Registros</h3>
+              <p className="text-muted text-sm" style={{ marginBottom: '16px' }}>
+                Introduce la contraseña de administrador para ver los logs del sistema.
+              </p>
+              <form onSubmit={handleViewLogs}>
+                <div className="form-group">
+                  <input
+                    type="password"
+                    value={logsPassword}
+                    onChange={(e) => setLogsPassword(e.target.value)}
+                    placeholder="Contraseña"
+                    className="form-control"
+                    autoFocus
+                  />
+                </div>
+                <div className="modal-actions" style={{ marginTop: '20px', display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                  <button type="button" className="btn btn-secondary" onClick={() => setShowLogsModal(false)}>
+                    Cancelar
+                  </button>
+                  <button type="submit" className="btn btn-primary">
+                    Acceder
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   )
