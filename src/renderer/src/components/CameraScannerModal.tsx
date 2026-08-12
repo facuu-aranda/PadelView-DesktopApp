@@ -10,39 +10,39 @@ interface CameraScannerModalProps {
 interface Template {
   key: string
   name: string
-  generate: (ip: string) => string
+  generate: (ip: string, channel: number) => string
 }
 
 const TEMPLATES: Template[] = [
   {
     key: 'mediamtx',
     name: 'MediaMTX / Simulador (Larix / OBS)',
-    generate: (ip) => `rtsp://${ip}:8554/live/cancha1`
+    generate: (ip, channel) => `rtsp://${ip}:8554/live/cancha${channel}`
   },
   {
     key: 'hikvision',
-    name: 'Hikvision',
-    generate: (ip) => `rtsp://admin:admin@${ip}:554/Streaming/Channels/101`
+    name: 'Hikvision / DVR',
+    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/Streaming/Channels/${channel}01`
   },
   {
     key: 'dahua',
     name: 'Dahua / Lorex / Amcrest',
-    generate: (ip) => `rtsp://admin:admin@${ip}:554/cam/realmonitor?channel=1&subtype=0`
+    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/cam/realmonitor?channel=${channel}&subtype=0`
   },
   {
     key: 'reolink',
     name: 'Reolink',
-    generate: (ip) => `rtsp://admin:admin@${ip}:554/h264Preview_01_main`
+    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/h264Preview_${channel.toString().padStart(2, '0')}_main`
   },
   {
     key: 'onvif',
     name: 'ONVIF Estándar',
-    generate: (ip) => `rtsp://admin:admin@${ip}:554/onvif1`
+    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/onvif${channel}`
   },
   {
     key: 'generic',
     name: 'Canal Genérico H.264',
-    generate: (ip) => `rtsp://admin:admin@${ip}:554/h264`
+    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/h264/ch${channel}/main/av_stream`
   }
 ]
 
@@ -57,6 +57,7 @@ export default function CameraScannerModal({
   const [progress, setProgress] = useState<number>(0)
   const [foundIPs, setFoundIPs] = useState<string[]>([])
   const [selectedIP, setSelectedIP] = useState<string>('')
+  const [channel, setChannel] = useState<number>(1)
 
   // Custom manual IP entry
   const [manualIP, setManualIP] = useState<string>('')
@@ -118,12 +119,12 @@ export default function CameraScannerModal({
     if (!selectedIP) return ''
     const template = TEMPLATES.find((t) => t.key === templateKey)
     if (!template) return ''
-    return template.generate(selectedIP.trim())
+    return template.generate(selectedIP.trim(), channel)
   }
 
   const activeGeneratedUrl = useMemo(() => {
     return getGeneratedUrl(activeTemplateKey)
-  }, [selectedIP, activeTemplateKey])
+  }, [selectedIP, activeTemplateKey, channel])
 
   const handleUseUrl = () => {
     if (activeGeneratedUrl) {
@@ -298,6 +299,18 @@ export default function CameraScannerModal({
                     {selectedIP}
                   </span>
                 </h4>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '10px 0' }}>
+                  <label style={{ fontSize: '13px', fontWeight: 500 }}>Canal (DVR/NVR):</label>
+                  <input 
+                    type="number" 
+                    min="1" 
+                    max="64" 
+                    value={channel} 
+                    onChange={(e) => setChannel(Number(e.target.value) || 1)}
+                    style={{ width: '60px', height: '28px', padding: '0 8px', fontSize: '13px', borderRadius: '4px', border: '1px solid var(--color-border)' }}
+                  />
+                </div>
 
                 {/* SUGGESTED BRAND CARDS */}
                 <div className="scanner-brand-cards">
