@@ -395,6 +395,7 @@ function App(): React.JSX.Element {
 
   // Login success handler from LoginScreen
   const handleLoginSuccess = async (session: any) => {
+    console.info(`[User Action Success] Usuario inició sesión exitosamente: ${session.user.email}`)
     setIsLoggedIn(true)
     setSessionUser(session.user)
     
@@ -471,6 +472,7 @@ function App(): React.JSX.Element {
 
   // Logout handler
   const handleLogout = async () => {
+    console.info('[User Action] Usuario cerró la sesión.')
     await supabase.auth.signOut()
     if (window.electron) {
       await window.electron.ipcRenderer.invoke('session:clear')
@@ -486,6 +488,7 @@ function App(): React.JSX.Element {
   // Play video handler
   // Direct R2 handlers for Video Library
   const handlePlayR2Video = async (key: string) => {
+    console.info(`[User Action] Reproduciendo video de biblioteca: ${key}`)
     setPlayingVideoId(key)
     setPlayingVideoUrl(null)
     if (window.electron) {
@@ -493,6 +496,7 @@ function App(): React.JSX.Element {
       if (res.success) {
         setPlayingVideoUrl(res.url)
       } else {
+        console.error(`[Action Failed] Error al obtener URL firmada para video: ${key}. Detalles: ${res.error || 'Desconocido'}`)
         showToast('Error al obtener URL del video', 'error')
         setPlayingVideoId(null)
       }
@@ -500,6 +504,7 @@ function App(): React.JSX.Element {
   }
 
   const handleDownloadR2Video = async (key: string) => {
+    console.info(`[User Action] Iniciando descarga de video: ${key}`)
     if (window.electron) {
       const res = await window.electron.ipcRenderer.invoke('config:get-signed-url', key, true)
       if (res.success) {
@@ -509,8 +514,10 @@ function App(): React.JSX.Element {
         document.body.appendChild(a)
         a.click()
         a.remove()
+        console.info(`[User Action Success] Descarga iniciada correctamente para: ${key}`)
         showToast('Iniciando descarga...', 'success')
       } else {
+        console.error(`[Action Failed] Error al descargar video ${key}. Detalles: ${res.error || 'Desconocido'}`)
         showToast('Error al obtener URL del video', 'error')
       }
     }
@@ -518,11 +525,14 @@ function App(): React.JSX.Element {
 
   const handleDeleteR2Video = async (key: string) => {
     if (!confirm('¿Estás seguro de que deseas eliminar este video permanentemente?') || !window.electron) return
+    console.info(`[User Action] Eliminando video de R2: ${key}`)
     const res = await window.electron.ipcRenderer.invoke('r2:delete-video', key)
     if (res.success) {
+      console.info(`[User Action Success] Video eliminado correctamente: ${key}`)
       showToast('Video eliminado exitosamente.', 'success')
       fetchData()
     } else {
+      console.error(`[Action Failed] Error al eliminar video de R2: ${key}. Detalles: ${res.error}`)
       showToast(`Error: ${res.error}`, 'error')
     }
   }
@@ -770,11 +780,14 @@ function App(): React.JSX.Element {
   // Save specific court RTSP url
   const handleSaveCourtRtsp = async (courtId: string, url: string) => {
     if (!window.electron) return
+    console.info(`[User Action] Guardando URL RTSP para la cancha: ${courtId}`)
     const res = await window.electron.ipcRenderer.invoke('config:save-rtsp', courtId, url)
     if (res.success) {
+      console.info(`[User Action Success] URL guardada exitosamente para la cancha: ${courtId}`)
       setCourtRtspUrls((prev) => ({ ...prev, [courtId]: url }))
       showToast('URL RTSP de la cancha guardada.', 'success')
     } else {
+      console.error(`[Action Failed] Error al guardar URL RTSP para la cancha: ${courtId}. Detalles: ${res.error}`)
       showToast(`Error al guardar RTSP: ${res.error}`, 'error')
     }
   }
@@ -784,6 +797,7 @@ function App(): React.JSX.Element {
     e.preventDefault()
     if (!newCourt.name || !window.electron) return
 
+    console.info(`[User Action] Intentando crear nueva cancha: ${newCourt.name}`)
     const res = await window.electron.ipcRenderer.invoke(
       'db:create-court',
       newCourt.name,
@@ -791,10 +805,12 @@ function App(): React.JSX.Element {
       sessionUser?.id
     )
     if (res.success) {
+      console.info(`[User Action Success] Cancha creada exitosamente: ${newCourt.name}`)
       showToast('Cancha agregada exitosamente.', 'success')
       setNewCourt({ name: '', rtsp_url: '' })
       fetchData()
     } else {
+      console.error(`[Action Failed] Error al crear la cancha ${newCourt.name}. Detalles: ${res.error}`)
       showToast(`Error: ${res.error}`, 'error')
     }
   }
@@ -802,12 +818,15 @@ function App(): React.JSX.Element {
   // Delete existing court
   const handleDeleteCourt = async (courtId: string) => {
     if (!window.electron) return
+    console.info(`[User Action] Intentando eliminar la cancha ID: ${courtId}`)
     const res = await window.electron.ipcRenderer.invoke('db:delete-court', courtId)
     if (res.success) {
+      console.info(`[User Action Success] Cancha ID ${courtId} eliminada exitosamente.`)
       showToast('Cancha eliminada exitosamente.', 'success')
       setCourtToDelete(null)
       fetchData()
     } else {
+      console.error(`[Action Failed] Error al eliminar cancha ID ${courtId}. Detalles: ${res.error}`)
       showToast(`Error al eliminar cancha: ${res.error}`, 'error')
     }
   }
@@ -817,9 +836,12 @@ function App(): React.JSX.Element {
     e.preventDefault()
     const { court_id, date, time, duration, player_name, player_phone } = newMatch
     if (!court_id || !date || !time || !player_name || !player_phone || !window.electron) {
+      console.warn('[User Action Warning] Intento de agendar partido con campos incompletos.')
       showToast('Por favor completa todos los campos del partido.', 'error')
       return
     }
+
+    console.info(`[User Action] Agendando partido para ${player_name} en cancha ${court_id} para el ${date} a las ${time}`)
 
     // Phone Pre-fill validation (Argentina code +549 prefixing)
     let formattedPhone = player_phone.trim().replace(/\s+/g, '')
@@ -843,6 +865,7 @@ function App(): React.JSX.Element {
     }, sessionUser?.id)
 
     if (res.success) {
+      console.info(`[User Action Success] Partido agendado correctamente para ${player_name}.`)
       showToast('Partido agendado correctamente.', 'success')
       setNewMatch({
         court_id: courts[0]?.id || '',
@@ -854,6 +877,7 @@ function App(): React.JSX.Element {
       })
       fetchData()
     } else {
+      console.error(`[Action Failed] Error al agendar partido para ${player_name}. Detalles: ${res.error}`)
       showToast(`Error al agendar partido: ${res.error}`, 'error')
     }
   }
@@ -861,6 +885,7 @@ function App(): React.JSX.Element {
   // Manual start recording on-demand
   const handleStartRecordingOnDemand = async (courtId: string) => {
     if (!window.electron) return
+    console.info(`[User Action] Iniciando grabación manual en demanda para la cancha ID: ${courtId}`)
     const startTime = new Date()
     const endTime = new Date(startTime.getTime() + 90 * 60000) // 90 min duration by default
 
@@ -873,9 +898,11 @@ function App(): React.JSX.Element {
     }, sessionUser?.id)
 
     if (res.success) {
+      console.info(`[User Action Success] Grabación manual iniciada correctamente en cancha ID: ${courtId}`)
       showToast('Grabación manual iniciada. Conectando con la cámara...', 'success')
       fetchData()
     } else {
+      console.error(`[Action Failed] Error al iniciar grabación manual en cancha ID: ${courtId}. Detalles: ${res.error}`)
       showToast(`Error al iniciar grabación: ${res.error}`, 'error')
     }
   }
@@ -883,11 +910,14 @@ function App(): React.JSX.Element {
   // Delete match
   const handleDeleteMatch = async (matchId: string) => {
     if (!confirm('¿Estás seguro de que deseas eliminar este partido?') || !window.electron) return
+    console.info(`[User Action] Eliminando partido ID: ${matchId}`)
     const res = await window.electron.ipcRenderer.invoke('db:delete-match', matchId)
     if (res.success) {
+      console.info(`[User Action Success] Partido eliminado correctamente ID: ${matchId}`)
       showToast('Partido eliminado.', 'success')
       fetchData()
     } else {
+      console.error(`[Action Failed] Error al eliminar partido ID: ${matchId}. Detalles: ${res.error}`)
       showToast(`Error: ${res.error}`, 'error')
     }
   }
@@ -900,8 +930,10 @@ function App(): React.JSX.Element {
       ) || !window.electron
     )
       return
+    console.info(`[User Action] Deteniendo grabación activa manualmente para el partido ID: ${matchId}`)
     const res = await window.electron.ipcRenderer.invoke('recordings:kill', matchId)
     if (res.success) {
+      console.info(`[User Action Success] Grabación detenida correctamente para partido ID: ${matchId}`)
       showToast('Grabación detenida. Iniciando procesamiento...', 'info')
       setActiveRecordings((prev) => {
         const copy = { ...prev }
@@ -910,6 +942,7 @@ function App(): React.JSX.Element {
       })
       fetchData()
     } else {
+      console.error(`[Action Failed] No se pudo detener la grabación para partido ID: ${matchId}.`)
       showToast('No se pudo detener la grabación.', 'error')
     }
   }
@@ -917,8 +950,10 @@ function App(): React.JSX.Element {
   // Cancel active upload manually
   const handleCancelUpload = async (matchId: string) => {
     if (!confirm('¿Cancelar la subida de este video?') || !window.electron) return
+    console.info(`[User Action] Cancelando subida de video para el partido ID: ${matchId}`)
     const res = await window.electron.ipcRenderer.invoke('uploads:cancel', matchId)
     if (res.success) {
+      console.info(`[User Action Success] Subida de video cancelada para partido ID: ${matchId}`)
       showToast('Subida cancelada.', 'warning')
       setActiveUploads((prev) => {
         const copy = { ...prev }
@@ -926,6 +961,8 @@ function App(): React.JSX.Element {
         return copy
       })
       fetchData()
+    } else {
+      console.error(`[Action Failed] No se pudo cancelar subida para partido ID: ${matchId}. Detalles: ${res?.error || 'Desconocido'}`)
     }
   }
 
