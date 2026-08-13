@@ -2265,20 +2265,6 @@ function App(): React.JSX.Element {
           {activeTab === 'config' && (
             <div className="config-view">
               <div className="config-form form-grid">
-                {/* System Logs Card */}
-                <div className="card-pane">
-                  <h3 className="card-title">Registros del Sistema</h3>
-                  <p className="text-muted text-sm" style={{ marginBottom: '16px' }}>
-                    Visualiza los registros internos de la aplicación para diagnóstico y solución de problemas.
-                  </p>
-                  <button
-                    className="btn btn-secondary"
-                    onClick={() => setShowLogsModal(true)}
-                  >
-                    Ver Logs
-                  </button>
-                </div>
-
                 {/* Visual Settings & Themes Card */}
                 <div className="card-pane">
                   <h3 className="card-title">Ajustes Visuales</h3>
@@ -2583,6 +2569,22 @@ function App(): React.JSX.Element {
                       ))}
                     </div>
                   )}
+                </div>
+
+                {/* System Logs Card - Horizontal */}
+                <div className="card-pane" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', gridColumn: '1 / -1' }}>
+                  <div>
+                    <h3 className="card-title" style={{ margin: 0, fontSize: '15px' }}>Registros del Sistema</h3>
+                    <p className="text-muted text-sm" style={{ margin: '4px 0 0 0' }}>
+                      Visualiza los logs internos para diagnóstico de errores.
+                    </p>
+                  </div>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => setShowLogsModal(true)}
+                  >
+                    Ver Logs
+                  </button>
                 </div>
               </div>
             </div>
