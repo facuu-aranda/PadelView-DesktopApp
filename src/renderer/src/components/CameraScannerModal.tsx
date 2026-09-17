@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo } from 'react'
-import { XCircle, RefreshCw, CheckCircle2, HelpCircle, Video, Plus } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { CheckCircle2, HelpCircle, Plus, RefreshCw, Video, XCircle } from 'lucide-react'
 
 interface CameraScannerModalProps {
   isOpen: boolean
@@ -7,363 +7,190 @@ interface CameraScannerModalProps {
   onSelectUrl: (url: string) => void
 }
 
-interface Template {
+interface DirectTemplate {
   key: string
   name: string
-  generate: (ip: string, channel: number) => string
+  path: string
 }
 
-const TEMPLATES: Template[] = [
-  {
-    key: 'mediamtx',
-    name: 'MediaMTX / Simulador (Larix / OBS)',
-    generate: (ip, channel) => `rtsp://${ip}:8554/live/cancha${channel}`
-  },
-  {
-    key: 'hikvision',
-    name: 'Hikvision / DVR',
-    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/Streaming/Channels/${channel}01`
-  },
-  {
-    key: 'dahua',
-    name: 'Dahua / Lorex / Amcrest',
-    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/cam/realmonitor?channel=${channel}&subtype=0`
-  },
-  {
-    key: 'reolink',
-    name: 'Reolink',
-    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/h264Preview_${channel.toString().padStart(2, '0')}_main`
-  },
-  {
-    key: 'onvif',
-    name: 'ONVIF Estándar',
-    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/onvif${channel}`
-  },
-  {
-    key: 'generic',
-    name: 'Canal Genérico H.264',
-    generate: (ip, channel) => `rtsp://admin:admin@${ip}:554/h264/ch${channel}/main/av_stream`
-  }
+const TEMPLATES: DirectTemplate[] = [
+  { key: 'mediamtx', name: 'MediaMTX', path: '/cancha-iphone' },
+  { key: 'hikvision', name: 'Hikvision IP', path: '/Streaming/Channels/101' },
+  { key: 'dahua', name: 'Dahua IP', path: '/cam/realmonitor?channel=1&subtype=0' },
+  { key: 'reolink', name: 'Reolink IP', path: '/h264Preview_01_main' },
+  { key: 'generic', name: 'RTSP genérico', path: '/h264/ch1/main/av_stream' }
 ]
 
 export default function CameraScannerModal({
   isOpen,
   onClose,
   onSelectUrl
-}: CameraScannerModalProps) {
-  if (!isOpen) return null
-
-  const [scanning, setScanning] = useState<boolean>(false)
-  const [progress, setProgress] = useState<number>(0)
+}: CameraScannerModalProps): React.JSX.Element | null {
+  const [scanning, setScanning] = useState(false)
+  const [progress, setProgress] = useState(0)
   const [foundIPs, setFoundIPs] = useState<string[]>([])
-  const [selectedIP, setSelectedIP] = useState<string>('')
-  const [channel, setChannel] = useState<number>(1)
+  const [selectedIP, setSelectedIP] = useState('')
+  const [manualIP, setManualIP] = useState('')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [rtspPort, setRtspPort] = useState('554')
+  const [activeTemplateKey, setActiveTemplateKey] = useState('mediamtx')
+  const [customPath, setCustomPath] = useState('/cancha-iphone')
 
-  // Custom manual IP entry
-  const [manualIP, setManualIP] = useState<string>('')
-
-  // Selected Suggestion Template key
-  const [activeTemplateKey, setActiveTemplateKey] = useState<string>('mediamtx')
-
-  // Trigger scan on mount
   useEffect(() => {
-    handleStartScan()
+    if (!isOpen) return
+    void handleStartScan()
 
-    const handleProgress = (_event: any, data: { percent: number; foundIPs: string[] }) => {
+    const handleProgress = (
+      _event: unknown,
+      data: { percent: number; foundIPs: string[] }
+    ) => {
       setProgress(data.percent)
       setFoundIPs(data.foundIPs)
     }
-
     window.electron.ipcRenderer.on('network:scan-progress', handleProgress)
+    return () => window.electron.ipcRenderer.removeAllListeners('network:scan-progress')
+  }, [isOpen])
 
-    return () => {
-      window.electron.ipcRenderer.removeAllListeners('network:scan-progress')
-    }
-  }, [])
+  const activeTemplate = TEMPLATES.find((template) => template.key === activeTemplateKey)
+  const activePath = activeTemplateKey === 'custom' ? customPath : activeTemplate?.path || customPath
+  const previewUrl = useMemo(() => {
+    if (!selectedIP || !activePath) return ''
+    const credentials = username.trim()
+      ? `${encodeURIComponent(username.trim())}:${encodeURIComponent(password)}@`
+      : ''
+    return `rtsp://${credentials}${selectedIP}:${Number(rtspPort) || 554}${activePath.startsWith('/') ? activePath : `/${activePath}`}`
+  }, [selectedIP, username, password, rtspPort, activePath])
+
+  if (!isOpen) return null
 
   const handleStartScan = async () => {
     setScanning(true)
     setProgress(0)
     setFoundIPs([])
     setSelectedIP('')
-
     try {
-      const res = await window.electron.ipcRenderer.invoke('network:scan-cameras')
-      if (res.success && res.foundIPs && res.foundIPs.length > 0) {
-        setFoundIPs(res.foundIPs)
-        setSelectedIP(res.foundIPs[0])
+      const result = await window.electron.ipcRenderer.invoke('network:scan-cameras')
+      if (result.success && result.foundIPs?.length) {
+        setFoundIPs(result.foundIPs)
+        setSelectedIP(result.foundIPs[0])
       }
-    } catch (err) {
-      console.error('Error scanning network:', err)
+    } catch (error) {
+      console.error('Error scanning direct camera network:', (error as Error).message)
     } finally {
       setScanning(false)
       setProgress(100)
     }
   }
 
-  const handleAddManualIP = (e: React.FormEvent) => {
-    e.preventDefault()
+  const handleAddManualIP = (event: React.FormEvent) => {
+    event.preventDefault()
     const trimmed = manualIP.trim()
     const ipRegex = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/
-    if (trimmed && ipRegex.test(trimmed)) {
-      if (!foundIPs.includes(trimmed)) {
-        setFoundIPs((prev) => [...prev, trimmed])
-      }
-      setSelectedIP(trimmed)
-      setManualIP('')
-    }
+    if (!trimmed || !ipRegex.test(trimmed)) return
+    if (!foundIPs.includes(trimmed)) setFoundIPs((current) => [...current, trimmed])
+    setSelectedIP(trimmed)
+    setManualIP('')
   }
-
-  // Generate URL for a specific template
-  const getGeneratedUrl = (templateKey: string) => {
-    if (!selectedIP) return ''
-    const template = TEMPLATES.find((t) => t.key === templateKey)
-    if (!template) return ''
-    return template.generate(selectedIP.trim(), channel)
-  }
-
-  const activeGeneratedUrl = useMemo(() => {
-    return getGeneratedUrl(activeTemplateKey)
-  }, [selectedIP, activeTemplateKey, channel])
 
   const handleUseUrl = () => {
-    if (activeGeneratedUrl) {
-      onSelectUrl(activeGeneratedUrl)
-      onClose()
-    }
+    if (!previewUrl) return
+    onSelectUrl(previewUrl)
+    onClose()
   }
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div
         className="modal-content"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          width: '800px',
-          maxWidth: '90vw',
-          maxHeight: '85vh',
-          display: 'flex',
-          flexDirection: 'column'
-        }}
+        onClick={(event) => event.stopPropagation()}
+        style={{ width: '820px', maxWidth: '94vw', maxHeight: '88vh', overflowY: 'auto' }}
       >
         <button className="modal-close-btn" onClick={onClose} type="button">
           <XCircle size={20} />
         </button>
-
-        <div style={{ flexShrink: 0 }}>
-          <h3 className="card-title" style={{ marginBottom: '5px' }}>
-            Seleccionar Dirección de Cámara
-          </h3>
-          <p className="text-muted text-sm" style={{ marginBottom: '15px' }}>
-            Selecciona la IP de la cámara detectada en la red local y elige la plantilla
-            correspondiente a su marca.
-          </p>
-        </div>
+        <h3 className="card-title" style={{ marginBottom: '5px' }}>
+          Buscar cámara IP directa
+        </h3>
+        <p className="text-muted text-sm" style={{ marginBottom: '16px' }}>
+          Este buscador sólo localiza cámaras que exponen RTSP directamente en la LAN. Para una
+          cámara conectada a un DVR/NVR usá el flujo de grabador.
+        </p>
 
         <div className="scanner-container">
-          {/* LEFT PANEL: SCAN STATUS & IP LIST */}
           <div className="scanner-left-panel">
             <div className="scanner-title-row">
-              <span className="scanner-ip-list-title">Dispositivos en Red</span>
-              <button
-                type="button"
-                onClick={handleStartScan}
-                disabled={scanning}
-                className="btn btn-secondary btn-sm"
-                style={{
-                  padding: '4px 10px',
-                  fontSize: '12px',
-                  display: 'flex',
-                  gap: '4px',
-                  alignItems: 'center'
-                }}
-              >
+              <span className="scanner-ip-list-title">Dispositivos RTSP en la red</span>
+              <button type="button" onClick={() => void handleStartScan()} disabled={scanning} className="btn btn-secondary btn-sm">
                 <RefreshCw size={12} className={scanning ? 'anim-spin' : ''} />
                 {scanning ? 'Buscando...' : 'Re-escanear'}
               </button>
             </div>
-
-            {/* PROGRESS BAR */}
             <div className="scanner-progress-container">
-              <div
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  marginBottom: '4px',
-                  fontSize: '11px'
-                }}
-              >
-                <span className="scanner-status-text">
-                  {scanning ? 'Escaneando subred local...' : 'Escaneo completo'}
-                </span>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px', fontSize: '11px' }}>
+                <span className="scanner-status-text">{scanning ? 'Escaneando subred local...' : 'Escaneo completo'}</span>
                 <span style={{ fontWeight: 600 }}>{progress}%</span>
               </div>
               <div className="scanner-progress-bar-bg">
                 <div className="scanner-progress-bar-fill" style={{ width: `${progress}%` }} />
               </div>
             </div>
-
-            {/* SCAN RESULTS LIST */}
-            <div className={`scanner-ip-list ${scanning ? 'scanner-scan-line-active' : ''}`}>
+            <div className="scanner-ip-list">
               {foundIPs.length === 0 ? (
                 <div className="scanner-empty-list" style={{ padding: '20px 10px' }}>
-                  {scanning ? (
-                    <>
-                      <RefreshCw size={20} className="anim-spin text-muted" />
-                      <p style={{ margin: 0 }}>Escaneando red local...</p>
-                    </>
-                  ) : (
-                    <>
-                      <HelpCircle size={20} className="text-muted" />
-                      <p style={{ fontSize: '12px', margin: 0 }}>
-                        No se encontraron cámaras de red.
-                      </p>
-                    </>
-                  )}
+                  {scanning ? <><RefreshCw size={20} className="anim-spin text-muted" /><p>Escaneando red local...</p></> : <><HelpCircle size={20} className="text-muted" /><p>No se encontraron cámaras IP directas.</p></>}
                 </div>
               ) : (
                 foundIPs.map((ip) => (
-                  <div
-                    key={ip}
-                    onClick={() => setSelectedIP(ip)}
-                    className={`scanner-ip-item ${selectedIP === ip ? 'active' : ''}`}
-                  >
-                    <div className="scanner-ip-item-icon">
-                      <Video size={14} />
-                    </div>
+                  <button key={ip} type="button" onClick={() => setSelectedIP(ip)} className={`scanner-ip-item ${selectedIP === ip ? 'active' : ''}`}>
+                    <span className="scanner-ip-item-icon"><Video size={14} /></span>
                     <span style={{ fontFamily: 'monospace' }}>{ip}</span>
-                  </div>
+                  </button>
                 ))
               )}
             </div>
-
-            {/* MANUAL IP ROW */}
-            <form
-              onSubmit={handleAddManualIP}
-              className="scanner-manual-ip-row"
-              style={{ flexShrink: 0 }}
-            >
-              <input
-                type="text"
-                placeholder="IP manual: Ej. 192.168.0.50"
-                value={manualIP}
-                onChange={(e) => setManualIP(e.target.value)}
-                style={{ height: '36px', fontSize: '13px' }}
-              />
-              <button
-                type="submit"
-                className="btn btn-secondary btn-sm"
-                style={{
-                  height: '36px',
-                  padding: '0 12px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '4px'
-                }}
-                title="Agregar dirección IP manual a la lista"
-              >
-                <Plus size={14} /> Agregar
-              </button>
+            <form onSubmit={handleAddManualIP} className="scanner-manual-ip-row">
+              <input type="text" placeholder="IP manual: 192.168.0.50" value={manualIP} onChange={(event) => setManualIP(event.target.value)} />
+              <button type="submit" className="btn btn-secondary btn-sm"><Plus size={14} /> Agregar</button>
             </form>
           </div>
 
-          {/* RIGHT PANEL: SIMPLIFIED SUGGESTIONS LIST */}
           <div className="scanner-right-panel">
             {!selectedIP ? (
-              <div
-                className="scanner-empty-list"
-                style={{
-                  background: 'rgba(0, 0, 0, 0.05)',
-                  border: '1px dashed var(--color-border)',
-                  borderRadius: '16px',
-                  height: '100%'
-                }}
-              >
+              <div className="scanner-empty-list" style={{ background: 'rgba(0, 0, 0, 0.05)', border: '1px dashed var(--color-border)', borderRadius: '16px', height: '100%' }}>
                 <HelpCircle size={32} className="text-muted" />
-                <h4 style={{ margin: '8px 0 4px 0', color: 'var(--color-text-primary)' }}>
-                  Sin Selección
-                </h4>
-                <p style={{ maxWidth: '280px', fontSize: '13px' }}>
-                  Selecciona una IP detectada en la lista o agrega una manualmente para ver las
-                  sugerencias de conexión.
-                </p>
+                <h4 style={{ margin: '8px 0 4px', color: 'var(--color-text-primary)' }}>Sin selección</h4>
+                <p style={{ maxWidth: '280px', fontSize: '13px' }}>Seleccioná una cámara IP detectada o agregá una dirección manual.</p>
               </div>
             ) : (
               <>
-                <h4
-                  className="scanner-section-title"
-                  style={{ margin: 0, fontSize: '14px', flexShrink: 0 }}
-                >
-                  Direcciones sugeridas para la IP:{' '}
-                  <span style={{ fontFamily: 'monospace', color: 'var(--color-secondary)' }}>
-                    {selectedIP}
-                  </span>
+                <h4 className="scanner-section-title" style={{ margin: 0, fontSize: '14px' }}>
+                  Configurar cámara IP: <span style={{ fontFamily: 'monospace', color: 'var(--color-secondary)' }}>{selectedIP}</span>
                 </h4>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', margin: '10px 0' }}>
-                  <label style={{ fontSize: '13px', fontWeight: 500 }}>Canal (DVR/NVR):</label>
-                  <input 
-                    type="number" 
-                    min="1" 
-                    max="64" 
-                    value={channel} 
-                    onChange={(e) => setChannel(Number(e.target.value) || 1)}
-                    style={{ width: '60px', height: '28px', padding: '0 8px', fontSize: '13px', borderRadius: '4px', border: '1px solid var(--color-border)' }}
-                  />
+                <div className="scanner-field-grid">
+                  <div className="form-group"><label>Usuario (opcional)</label><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="off" /></div>
+                  <div className="form-group"><label>Contraseña (opcional)</label><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="off" /></div>
+                  <div className="form-group"><label>Puerto RTSP</label><input type="number" min="1" max="65535" value={rtspPort} onChange={(event) => setRtspPort(event.target.value)} /></div>
                 </div>
-
-                {/* SUGGESTED BRAND CARDS */}
                 <div className="scanner-brand-cards">
-                  {TEMPLATES.map((t) => {
-                    const generated = getGeneratedUrl(t.key)
-                    const isActive = activeTemplateKey === t.key
-                    return (
-                      <div
-                        key={t.key}
-                        onClick={() => setActiveTemplateKey(t.key)}
-                        className={`scanner-brand-card ${isActive ? 'active' : ''}`}
-                      >
-                        <div className="scanner-brand-card-header">
-                          <span className="scanner-brand-title">{t.name}</span>
-                          {isActive && (
-                            <span
-                              style={{
-                                color: 'var(--color-primary)',
-                                display: 'flex',
-                                alignItems: 'center'
-                              }}
-                            >
-                              <CheckCircle2 size={14} />
-                            </span>
-                          )}
-                        </div>
-                        <div className="scanner-brand-url">{generated}</div>
-                      </div>
-                    )
-                  })}
+                  {TEMPLATES.map((template) => (
+                    <button key={template.key} type="button" onClick={() => setActiveTemplateKey(template.key)} className={`scanner-brand-card ${activeTemplateKey === template.key ? 'active' : ''}`}>
+                      <span className="scanner-brand-card-header"><span className="scanner-brand-title">{template.name}</span>{activeTemplateKey === template.key && <CheckCircle2 size={14} />}</span>
+                      <span className="scanner-brand-url">{template.path}</span>
+                    </button>
+                  ))}
+                  <label className={`scanner-brand-card ${activeTemplateKey === 'custom' ? 'active' : ''}`}>
+                    <span className="scanner-brand-card-header"><span className="scanner-brand-title">Ruta manual</span>{activeTemplateKey === 'custom' && <CheckCircle2 size={14} />}</span>
+                    <input value={customPath} onFocus={() => setActiveTemplateKey('custom')} onChange={(event) => { setCustomPath(event.target.value); setActiveTemplateKey('custom') }} placeholder="/ruta/rtsp" />
+                  </label>
                 </div>
-
-                {/* FOOTER ACTIONS */}
-                <div
-                  className="scanner-actions"
-                  style={{
-                    marginTop: 'auto',
-                    paddingTop: '12px',
-                    borderTop: '1px solid var(--color-border)',
-                    flexShrink: 0
-                  }}
-                >
-                  <button type="button" onClick={onClose} className="btn btn-secondary">
-                    Cancelar
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleUseUrl}
-                    disabled={!selectedIP}
-                    className="btn btn-primary"
-                  >
-                    Usar Dirección Seleccionada
-                  </button>
+                <div className="scanner-url-preview-box">
+                  <span className="scanner-url-preview-label">URL generada (la contraseña se guarda en el vault local)</span>
+                  <span className="scanner-url-preview-text">{redactPreviewUrl(previewUrl)}</span>
+                </div>
+                <div className="scanner-actions" style={{ marginTop: 'auto', paddingTop: '12px', borderTop: '1px solid var(--color-border)' }}>
+                  <button type="button" onClick={onClose} className="btn btn-secondary">Cancelar</button>
+                  <button type="button" onClick={handleUseUrl} disabled={!previewUrl} className="btn btn-primary">Usar cámara IP</button>
                 </div>
               </>
             )}
@@ -372,4 +199,8 @@ export default function CameraScannerModal({
       </div>
     </div>
   )
+}
+
+function redactPreviewUrl(url: string): string {
+  return url.replace(/(rtsp:\/\/)[^@]+@/i, '$1***:***@')
 }

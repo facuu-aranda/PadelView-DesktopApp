@@ -1,8 +1,9 @@
 import { randomUUID } from 'crypto'
 import Store from 'electron-store'
 import { vaultService } from './vault.service'
+import type { VideoSource } from '../../shared/video-source'
 
-export const LOCAL_COURT_STORAGE_VERSION = 1
+export const LOCAL_COURT_STORAGE_VERSION = 2
 
 export interface LocalCourt {
   id: string
@@ -11,11 +12,13 @@ export interface LocalCourt {
   updated_at: string
   profile_id: string
   is_dvr: boolean
+  video_source: VideoSource
 }
 
 export interface LocalCourtUpdate {
   name?: string
   is_dvr?: boolean
+  video_source?: VideoSource
 }
 
 export interface CloudCourtRecord {
@@ -32,6 +35,7 @@ interface StoredCourt {
   updated_at?: string
   profile_id: string
   is_dvr?: boolean
+  video_source?: VideoSource
 }
 
 interface LocalCourtSchema {
@@ -77,18 +81,26 @@ class LocalCourtService {
     return court ? this.toLocalCourt(court) : null
   }
 
-  public create(name: string, profileId: string, isDvr = false): LocalCourt {
+  public create(
+    name: string,
+    profileId: string,
+    isDvr = false,
+    videoSource?: VideoSource
+  ): LocalCourt {
     const normalizedName = this.normalizeName(name)
     this.assertProfileId(profileId)
 
     const now = new Date().toISOString()
+    const id = randomUUID()
+    const source = videoSource || { type: 'direct-camera', rtspKey: `RTSP_URL_${id}` }
     const court: StoredCourt = {
-      id: randomUUID(),
+      id,
       name: normalizedName,
       created_at: now,
       updated_at: now,
       profile_id: profileId,
-      is_dvr: Boolean(isDvr)
+      is_dvr: source.type === 'recorder' || Boolean(isDvr),
+      video_source: source
     }
 
     this.store.set('courts', [...this.store.get('courts'), court])
@@ -111,7 +123,14 @@ class LocalCourtService {
     const updated: StoredCourt = {
       ...current,
       ...(updates.name === undefined ? {} : { name: this.normalizeName(updates.name) }),
-      ...(updates.is_dvr === undefined ? {} : { is_dvr: Boolean(updates.is_dvr) }),
+      ...(updates.video_source === undefined ? {} : { video_source: updates.video_source }),
+      ...(updates.is_dvr === undefined && updates.video_source === undefined
+        ? {}
+        : {
+            is_dvr:
+              updates.video_source?.type === 'recorder' ||
+              (updates.video_source === undefined ? Boolean(updates.is_dvr) : false)
+          }),
       updated_at: new Date().toISOString()
     }
 
@@ -136,6 +155,9 @@ class LocalCourtService {
       courts.filter((candidate) => candidate.id !== courtId)
     )
     vaultService.deleteSecret(`RTSP_URL_${courtId}`)
+    if (court.video_source?.type === 'recorder' && court.video_source.manualRtspKey) {
+      vaultService.deleteSecret(court.video_source.manualRtspKey)
+    }
     return true
   }
 
@@ -192,7 +214,11 @@ class LocalCourtService {
         created_at: createdAt,
         updated_at: new Date().toISOString(),
         profile_id: profileId,
-        is_dvr: false
+        is_dvr: false,
+        video_source: {
+          type: 'direct-camera',
+          rtspKey: `RTSP_URL_${cloudCourt.id}`
+        }
       })
 
       if (cloudCourt.rtsp_url_key) {
@@ -226,7 +252,12 @@ class LocalCourtService {
       created_at: court.created_at,
       updated_at: court.updated_at || court.created_at,
       profile_id: court.profile_id,
-      is_dvr: Boolean(court.is_dvr)
+      is_dvr: court.video_source?.type === 'recorder' || Boolean(court.is_dvr),
+      video_source:
+        court.video_source || {
+          type: 'direct-camera',
+          rtspKey: `RTSP_URL_${court.id}`
+        }
     }
   }
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Activity,
   Calendar,
@@ -26,8 +26,11 @@ import {
 import padelCourtSvg from './assets/PadelCourt.svg'
 import logoPng from './assets/logo.png'
 import CameraScannerModal from './components/CameraScannerModal'
+import RecorderSetupModal from './components/RecorderSetupModal'
+import VideoSourcePreview from './components/VideoSourcePreview'
 import LoginScreen from './components/LoginScreen'
 import { supabase } from './lib/supabase'
+import type { VideoSource } from '../../shared/video-source'
 
 interface Court {
   id: string
@@ -36,6 +39,7 @@ interface Court {
   updated_at: string
   profile_id: string
   is_dvr: boolean
+  video_source: VideoSource
 }
 
 interface Match {
@@ -95,168 +99,6 @@ const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [
   }
 ]
 
-interface LiveCourtStreamProps {
-  courtId: string
-  rtspUrl: string
-}
-
-function LiveCourtStream({ courtId, rtspUrl }: LiveCourtStreamProps): React.JSX.Element {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const playerRef = useRef<any>(null)
-  const sourceRef = useRef<any>(null)
-
-  useEffect(() => {
-    if (!rtspUrl) return
-
-    const JSMpeg = (window as any).JSMpeg
-    console.log(
-      `[Renderer] LiveCourtStream useEffect mounted for court ${courtId}. JSMpeg exists:`,
-      !!JSMpeg,
-      'Canvas exists:',
-      !!canvasRef.current
-    )
-    if (!JSMpeg || !canvasRef.current) {
-      if (!JSMpeg) console.warn(`[Renderer] window.JSMpeg is NOT defined!`)
-      return
-    }
-
-    let sourceInstance: any = null
-
-    class CustomSource {
-      destination: any = null
-      streaming = true
-      established = false
-      progress = 0
-
-      constructor() {
-        sourceInstance = this
-      }
-
-      connect(destination: any) {
-        this.destination = destination
-      }
-
-      start() {}
-      resume() {}
-
-      destroy() {
-        this.destination = null
-      }
-    }
-
-    // Initialize player with custom source
-    const player = new JSMpeg.Player('', {
-      source: CustomSource,
-      canvas: canvasRef.current,
-      autoplay: true,
-      audio: false,
-      videoBufferSize: 512 * 1024
-    })
-
-    playerRef.current = player
-    sourceRef.current = sourceInstance
-
-    // Start streaming process in main
-    window.electron.ipcRenderer.invoke('stream:start', { courtId, rtspUrl })
-
-    // Listen to IPC stream data chunk events
-    let chunkCount = 0
-    const handleData = (_event: any, chunk: Uint8Array) => {
-      chunkCount++
-      if (chunkCount <= 5 || chunkCount % 100 === 0) {
-        console.log(
-          `[Renderer] Received chunk #${chunkCount} for court ${courtId} (size: ${chunk.length})`
-        )
-      }
-      if (sourceInstance && sourceInstance.destination) {
-        sourceInstance.established = true
-        sourceInstance.progress = 1
-        // Create a clean copy of the ArrayBuffer from the pooled Uint8Array chunk
-        const arrayBuffer = chunk.buffer.slice(
-          chunk.byteOffset,
-          chunk.byteOffset + chunk.byteLength
-        )
-        sourceInstance.destination.write(arrayBuffer)
-      } else {
-        console.warn(`[Renderer] No sourceInstance or destination for court ${courtId}!`)
-      }
-    }
-
-    window.electron.ipcRenderer.on(`stream:data:${courtId}`, handleData)
-
-    return () => {
-      console.log(`[Renderer] LiveCourtStream useEffect cleanup for court ${courtId}`)
-      // Clean up listeners and stop streaming in main
-      window.electron.ipcRenderer.removeAllListeners(`stream:data:${courtId}`)
-      window.electron.ipcRenderer.invoke('stream:stop', courtId)
-
-      if (playerRef.current) {
-        playerRef.current.destroy()
-      }
-    }
-  }, [courtId, rtspUrl])
-
-  if (!rtspUrl) {
-    return (
-      <div
-        style={{
-          position: 'relative',
-          width: '100%',
-          aspectRatio: '16/9',
-          backgroundColor: '#000',
-          borderRadius: '12px',
-          overflow: 'hidden',
-          border: '1px solid var(--color-border)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center'
-        }}
-      >
-        <span className="text-secondary text-xs">Cámara no configurada</span>
-      </div>
-    )
-  }
-
-  return (
-    <div
-      style={{
-        position: 'relative',
-        width: '100%',
-        aspectRatio: '16/9',
-        backgroundColor: '#000',
-        borderRadius: '12px',
-        overflow: 'hidden',
-        border: '1px solid var(--color-border)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center'
-      }}
-    >
-      <canvas
-        ref={canvasRef}
-        style={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover' }}
-      />
-      <span
-        className="badge-live animate-pulse-fast"
-        style={{
-          position: 'absolute',
-          top: '10px',
-          left: '10px',
-          zIndex: 10,
-          fontSize: '10px',
-          background: '#ef4444',
-          color: '#fff',
-          padding: '2px 6px',
-          borderRadius: '4px',
-          fontWeight: 'bold'
-        }}
-      >
-        EN VIVO
-      </span>
-    </div>
-  )
-}
-
 function App(): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<
     'dashboard' | 'scheduler' | 'courts' | 'videos' | 'config' | 'profile'
@@ -286,6 +128,8 @@ function App(): React.JSX.Element {
 
   // Modal open states
   const [isCreateCourtModalOpen, setIsCreateCourtModalOpen] = useState<boolean>(false)
+  const [isSourceTypeModalOpen, setIsSourceTypeModalOpen] = useState<boolean>(false)
+  const [isRecorderSetupModalOpen, setIsRecorderSetupModalOpen] = useState<boolean>(false)
   const [isScanModalOpen, setIsScanModalOpen] = useState<boolean>(false)
   const [courtToEdit, setCourtToEdit] = useState<Court | null>(null)
   const [courtToDelete, setCourtToDelete] = useState<Court | null>(null)
@@ -326,6 +170,7 @@ function App(): React.JSX.Element {
   // Active Process States (updated via IPC)
   const [activeRecordings, setActiveRecordings] = useState<Record<string, ActiveRecording>>({})
   const [activeUploads, setActiveUploads] = useState<Record<string, ActiveUpload>>({})
+  const [startingRecordings, setStartingRecordings] = useState<Record<string, boolean>>({})
   const [bucketUsageBytes, setBucketUsageBytes] = useState<number>(0)
 
   // Form States
@@ -338,7 +183,11 @@ function App(): React.JSX.Element {
     player_phone: ''
   })
 
-  const [newCourt, setNewCourt] = useState({
+  const [newCourt, setNewCourt] = useState<{
+    name: string
+    rtsp_url: string
+    video_source?: VideoSource
+  }>({
     name: '',
     rtsp_url: ''
   })
@@ -832,7 +681,8 @@ function App(): React.JSX.Element {
     console.info(`[User Action] Intentando crear nueva cancha: ${newCourt.name}`)
     const res = await window.electron.ipcRenderer.invoke('courts:create', {
       name: newCourt.name,
-      rtspUrl: newCourt.rtsp_url,
+      rtspUrl: newCourt.video_source?.type === 'recorder' ? undefined : newCourt.rtsp_url,
+      videoSource: newCourt.video_source,
       profileId: sessionUser?.id
     })
     if (res.success) {
@@ -854,7 +704,8 @@ function App(): React.JSX.Element {
     const res = await window.electron.ipcRenderer.invoke('courts:update', {
       courtId: courtToEdit.id,
       name: newCourt.name,
-      rtspUrl: newCourt.rtsp_url,
+      rtspUrl: newCourt.video_source?.type === 'recorder' ? undefined : newCourt.rtsp_url,
+      videoSource: newCourt.video_source,
       profileId: sessionUser?.id
     })
 
@@ -867,6 +718,23 @@ function App(): React.JSX.Element {
     } else {
       showToast(`Error al actualizar la cancha: ${res.error}`, 'error')
     }
+  }
+
+  const beginCourtRegistration = () => {
+    setCourtToEdit(null)
+    setNewCourt({ name: '', rtsp_url: '' })
+    setIsSourceTypeModalOpen(true)
+  }
+
+  const chooseDirectCamera = () => {
+    setIsSourceTypeModalOpen(false)
+    setNewCourt((current) => ({ ...current, video_source: undefined }))
+    setIsCreateCourtModalOpen(true)
+  }
+
+  const chooseRecorder = () => {
+    setIsSourceTypeModalOpen(false)
+    setIsRecorderSetupModalOpen(true)
   }
 
   // Delete existing court
@@ -941,26 +809,35 @@ function App(): React.JSX.Element {
 
   // Manual start recording on-demand
   const handleStartRecordingOnDemand = async (courtId: string) => {
-    if (!window.electron) return
+    if (!window.electron || !sessionUser?.id || startingRecordings[courtId]) return
+    setStartingRecordings((current) => ({ ...current, [courtId]: true }))
     console.info(`[User Action] Iniciando grabación manual en demanda para la cancha ID: ${courtId}`)
-    const startTime = new Date()
-    const endTime = new Date(startTime.getTime() + 90 * 60000) // 90 min duration by default
 
-    const res = await window.electron.ipcRenderer.invoke('db:create-match', {
-      court_id: courtId,
-      start_time: startTime.toISOString(),
-      end_time: endTime.toISOString(),
-      player_name: 'Grabación Manual',
-      player_phone: '+5490000000000'
-    }, sessionUser?.id)
+    try {
+      const res = await window.electron.ipcRenderer.invoke('recordings:start', {
+        courtId,
+        profileId: sessionUser.id
+      })
 
-    if (res.success) {
-      console.info(`[User Action Success] Grabación manual iniciada correctamente en cancha ID: ${courtId}`)
-      showToast('Grabación manual iniciada. Conectando con la cámara...', 'success')
-      fetchData()
-    } else {
-      console.error(`[Action Failed] Error al iniciar grabación manual en cancha ID: ${courtId}. Detalles: ${res.error}`)
-      showToast(`Error al iniciar grabación: ${res.error}`, 'error')
+      if (res.success) {
+        console.info(`[User Action Success] Grabación manual iniciada correctamente en cancha ID: ${courtId}`)
+        showToast(
+          res.alreadyActive
+            ? 'La grabación manual ya estaba iniciada.'
+            : 'Grabación manual iniciada. Conectando con la cámara...',
+          'success'
+        )
+        await fetchData()
+      } else {
+        console.error(`[Action Failed] Error al iniciar la cancha ${courtId}. Detalles: ${res.error}`)
+        showToast(`Error al iniciar grabación: ${res.error}`, 'error')
+      }
+    } finally {
+      setStartingRecordings((current) => {
+        const next = { ...current }
+        delete next[courtId]
+        return next
+      })
     }
   }
 
@@ -992,7 +869,10 @@ function App(): React.JSX.Element {
     )
       return
     console.info(`[User Action] Deteniendo grabación activa manualmente para el partido ID: ${matchId}`)
-    const res = await window.electron.ipcRenderer.invoke('recordings:kill', matchId)
+    const res = await window.electron.ipcRenderer.invoke('recordings:kill', {
+      matchId,
+      profileId: sessionUser?.id
+    })
     if (res.success) {
       console.info(`[User Action Success] Grabación detenida correctamente para partido ID: ${matchId}`)
       showToast('Grabación detenida. Iniciando procesamiento...', 'info')
@@ -1461,13 +1341,13 @@ function App(): React.JSX.Element {
                                       <button
                                         type="button"
                                         className="dropdown-item"
-                                        disabled={isRecording}
+                                        disabled={isRecording || startingRecordings[court.id]}
                                         onClick={async () => {
                                           setOpenDropdownCourtId(null)
                                           await handleStartRecordingOnDemand(court.id)
                                         }}
                                       >
-                                        <Play size={12} /> Iniciar grabación
+                                        <Play size={12} /> {startingRecordings[court.id] ? 'Iniciando...' : 'Iniciar grabación'}
                                       </button>
                                       <button
                                         type="button"
@@ -1511,9 +1391,10 @@ function App(): React.JSX.Element {
                             <div className="court-card-body">
                               {isPreviewActive && (
                                 <div style={{ marginBottom: '12px' }}>
-                                  <LiveCourtStream
+                                  <VideoSourcePreview
                                     courtId={court.id}
-                                    rtspUrl={courtRtspUrls[court.id] || ''}
+                                    profileId={sessionUser?.id}
+                                    source={court.video_source}
                                   />
                                 </div>
                               )}
@@ -2033,11 +1914,7 @@ function App(): React.JSX.Element {
                 </h3>
                 <button
                   className="btn btn-primary btn-sm"
-                  onClick={() => {
-                    setCourtToEdit(null)
-                    setNewCourt({ name: '', rtsp_url: '' })
-                    setIsCreateCourtModalOpen(true)
-                  }}
+                  onClick={beginCourtRegistration}
                 >
                   <Plus size={16} style={{ marginRight: '6px' }} />
                   Registrar Cancha
@@ -2050,11 +1927,7 @@ function App(): React.JSX.Element {
                   <p>No hay canchas configuradas en este club.</p>
                   <button
                     className="btn btn-primary btn-sm"
-                    onClick={() => {
-                      setCourtToEdit(null)
-                      setNewCourt({ name: '', rtsp_url: '' })
-                      setIsCreateCourtModalOpen(true)
-                    }}
+                    onClick={beginCourtRegistration}
                   >
                     Registrar Primera Cancha
                   </button>
@@ -2147,7 +2020,13 @@ function App(): React.JSX.Element {
                                       setCourtToEdit(court)
                                       setNewCourt({
                                         name: court.name,
-                                        rtsp_url: courtRtspUrls[court.id] || ''
+                                        rtsp_url:
+                                          court.video_source?.type === 'direct-camera'
+                                            ? courtRtspUrls[court.id] || ''
+                                            : '',
+                                        video_source: court.video_source?.type === 'recorder'
+                                          ? court.video_source
+                                          : undefined
                                       })
                                       setIsCreateCourtModalOpen(true)
                                     }}
@@ -2237,30 +2116,49 @@ function App(): React.JSX.Element {
                       </div>
 
                       <div className="form-group">
-                        <label>Stream RTSP local</label>
-                        <div className="rtsp-input-wrapper">
-                          <input
-                            type="text"
-                            placeholder="rtsp://usuario:contraseña@ip:puerto/h264"
-                            value={newCourt.rtsp_url}
-                            onChange={(e) => setNewCourt({ ...newCourt, rtsp_url: e.target.value })}
-                          />
-                          <button
-                            type="button"
-                            className="scanner-scan-btn"
-                            onClick={() => setIsScanModalOpen(true)}
-                            title="Buscar cámaras en la red local"
-                          >
-                            <Video size={16} /> Buscar en Red
-                          </button>
-                        </div>
+                        <label>Fuente de video</label>
+                        {newCourt.video_source?.type === 'recorder' ? (
+                          <div className="card-pane" style={{ padding: '12px' }}>
+                            <strong>DVR / NVR</strong>
+                            <p className="text-muted text-sm" style={{ margin: '6px 0 10px' }}>
+                              Canal {newCourt.video_source.channelNumber || newCourt.video_source.channelId}
+                            </p>
+                            <button type="button" className="btn btn-secondary btn-sm" onClick={chooseRecorder}>
+                              Cambiar canal
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="rtsp-input-wrapper">
+                            <input
+                              type="text"
+                              placeholder="rtsp://usuario:contraseña@ip:puerto/h264"
+                              value={newCourt.rtsp_url}
+                              onChange={(e) => setNewCourt({ ...newCourt, rtsp_url: e.target.value })}
+                            />
+                            <button
+                              type="button"
+                              className="scanner-scan-btn"
+                              onClick={() => setIsScanModalOpen(true)}
+                              title="Buscar cámaras IP directas en la red local"
+                            >
+                              <Video size={16} /> Buscar cámara IP
+                            </button>
+                          </div>
+                        )}
                       </div>
 
                       <div className="form-group" style={{ marginTop: '16px' }}>
                         <label>Previsualización de Cámara</label>
                         <div style={{ marginTop: '8px' }}>
-                          {newCourt.rtsp_url ? (
-                            <LiveCourtStream courtId="preview-camera" rtspUrl={newCourt.rtsp_url} />
+                          {newCourt.video_source?.type === 'recorder' ? (
+                            <VideoSourcePreview
+                              courtId="recorder-court-preview"
+                              profileId={sessionUser?.id}
+                              source={newCourt.video_source}
+                              compact
+                            />
+                          ) : newCourt.rtsp_url ? (
+                            <VideoSourcePreview courtId="preview-camera" rtspUrl={newCourt.rtsp_url} compact />
                           ) : (
                             <div
                               style={{
@@ -2274,7 +2172,7 @@ function App(): React.JSX.Element {
                                 justifyContent: 'center'
                               }}
                             >
-                              <span className="text-muted text-sm">Ingresa una URL RTSP para previsualizar</span>
+                              <span className="text-muted text-sm">Ingresá una URL RTSP para previsualizar</span>
                             </div>
                           )}
                         </div>
@@ -2297,6 +2195,48 @@ function App(): React.JSX.Element {
                   isOpen={isScanModalOpen}
                   onClose={() => setIsScanModalOpen(false)}
                   onSelectUrl={(url) => setNewCourt({ ...newCourt, rtsp_url: url })}
+                />
+              )}
+
+              {isSourceTypeModalOpen && (
+                <div className="modal-overlay" onClick={() => setIsSourceTypeModalOpen(false)}>
+                  <div className="modal-content" onClick={(event) => event.stopPropagation()} style={{ width: '680px', maxWidth: '92vw' }}>
+                    <button className="modal-close-btn" onClick={() => setIsSourceTypeModalOpen(false)} type="button">
+                      <XCircle size={20} />
+                    </button>
+                    <h3 className="card-title" style={{ marginBottom: '8px' }}>¿Cómo está conectada la cámara?</h3>
+                    <p className="text-muted text-sm" style={{ marginBottom: '20px' }}>
+                      Elegí el tipo de fuente para mantener separado el flujo de cámaras IP del flujo de grabadores.
+                    </p>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
+                      <button type="button" className="card-pane" onClick={chooseDirectCamera} style={{ textAlign: 'left', padding: '18px', cursor: 'pointer' }}>
+                        <Video size={24} style={{ color: 'var(--color-primary)', marginBottom: '10px' }} />
+                        <strong style={{ display: 'block' }}>Cámara IP</strong>
+                        <span className="text-muted text-sm">Cámara conectada directamente a la red local.</span>
+                      </button>
+                      <button type="button" className="card-pane" onClick={chooseRecorder} style={{ textAlign: 'left', padding: '18px', cursor: 'pointer' }}>
+                        <Grid size={24} style={{ color: 'var(--color-primary)', marginBottom: '10px' }} />
+                        <strong style={{ display: 'block' }}>DVR / NVR</strong>
+                        <span className="text-muted text-sm">Cámara administrada por un grabador y sus canales.</span>
+                      </button>
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
+                      <button className="btn btn-secondary" type="button" onClick={() => setIsSourceTypeModalOpen(false)}>Cancelar</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {isRecorderSetupModalOpen && (
+                <RecorderSetupModal
+                  isOpen={isRecorderSetupModalOpen}
+                  profileId={sessionUser?.id || ''}
+                  onClose={() => setIsRecorderSetupModalOpen(false)}
+                  onSelectSource={(source) => {
+                    setNewCourt((current) => ({ ...current, video_source: source, rtsp_url: '' }))
+                    setIsRecorderSetupModalOpen(false)
+                    setIsCreateCourtModalOpen(true)
+                  }}
                 />
               )}
 
