@@ -6,10 +6,13 @@ import { dbService } from './db.service'
 import { ffmpegService } from './ffmpeg.service'
 import { r2Service } from './r2.service'
 import { vaultService } from './vault.service'
+import { localCourtService } from './local-court.service'
 
 export interface Match {
   id: string
   court_id: string
+  court_name?: string | null
+  profile_id?: string | null
   start_time: string
   end_time: string
   status: 'SCHEDULED' | 'RECORDING' | 'UPLOADING' | 'DONE' | 'FAILED'
@@ -22,6 +25,8 @@ export interface Match {
 class SchedulerService {
   private timer: NodeJS.Timeout | null = null
   private isProcessing = false
+  private isSessionReady = false
+  private readyProfileId: string | null = null
   private tempDir: string
   private lastCleanupTime: number = 0
 
@@ -64,11 +69,34 @@ class SchedulerService {
     }
   }
 
+  public sessionTokenUpdated(profileId: string | null): void {
+    if (!profileId || this.readyProfileId !== profileId) {
+      this.isSessionReady = false
+      this.readyProfileId = profileId
+    }
+  }
+
+  public sessionClosed(): void {
+    this.isSessionReady = false
+    this.readyProfileId = null
+  }
+
+  public sessionReady(): void {
+    this.isSessionReady = true
+    this.readyProfileId = dbService.getProfileId()
+    this.recoverOrphanedMatches().catch((err) => {
+      console.error('Error during session recovery:', err)
+    })
+    this.tick().catch((err) => {
+      console.error('Error during session scheduler tick:', err)
+    })
+  }
+
   /**
    * Main scheduler tick logic.
    */
   private async tick(): Promise<void> {
-    if (this.isProcessing) return
+    if (this.isProcessing || !this.isSessionReady || !dbService.getProfileId()) return
 
     // Verify client configurations exist before making queries
     try {
@@ -83,6 +111,9 @@ class SchedulerService {
 
     try {
       const now = new Date()
+      const profileId = dbService.getProfileId()
+      if (!profileId) return
+
       const db = dbService.getClient()
 
       // 1. Fetch scheduled matches starting soon (e.g. within next 2 hours or already passed)
@@ -90,6 +121,7 @@ class SchedulerService {
       const { data: matches, error } = await db
         .from('matches')
         .select('*')
+        .eq('profile_id', profileId)
         .eq('status', 'SCHEDULED')
         .order('start_time', { ascending: true })
 
@@ -150,31 +182,28 @@ class SchedulerService {
    */
   private async processRecordingStart(match: Match, now: Date, endTime: Date): Promise<void> {
     const db = dbService.getClient()
+    const profileId = match.profile_id || dbService.getProfileId()
 
-    // 1. Retrieve court configuration for RTSP URL
-    const { data: court, error: courtErr } = await db
-      .from('courts')
-      .select('*')
-      .eq('id', match.court_id)
-      .single()
-
-    if (courtErr || !court) {
-      console.error(`Court configuration not found for match ${match.id}:`, courtErr)
+    // Resolve the local court and its protected RTSP secret. Supabase courts is never queried here.
+    const court = profileId ? localCourtService.getById(match.court_id, profileId) : null
+    if (!court) {
+      console.error(`Local court configuration not found for match ${match.id}.`)
       await db
         .from('matches')
-        .update({ status: 'FAILED', error_log: `Court config missing: ${courtErr?.message}` })
+        .update({ status: 'FAILED', error_log: 'Local court configuration is missing.' })
         .eq('id', match.id)
+      this.notifyUI('match-updated', match.id)
       return
     }
 
-    // Resolve RTSP URL from vault or default to config
-    let rtspUrl = vaultService.getSecret(`RTSP_URL_${court.id}`) || court.rtsp_url_key
+    const rtspUrl = vaultService.getSecret(`RTSP_URL_${court.id}`)
     if (!rtspUrl) {
-      console.error(`RTSP URL not found for court ${court.id}`)
+      console.error(`RTSP URL not found in local vault for court ${court.id}.`)
       await db
         .from('matches')
-        .update({ status: 'FAILED', error_log: `RTSP Stream URL is not configured.` })
+        .update({ status: 'FAILED', error_log: 'RTSP stream URL is not configured locally.' })
         .eq('id', match.id)
+      this.notifyUI('match-updated', match.id)
       return
     }
 
@@ -317,13 +346,17 @@ class SchedulerService {
       return // Config not set up
     }
 
+    const profileId = dbService.getProfileId()
+    if (!profileId) return
+
     const db = dbService.getClient()
     console.log('Checking for orphaned or interrupted recordings...')
 
-    // Find any matches in 'RECORDING' or 'UPLOADING' state
+    // Find any matches in 'RECORDING' or 'UPLOADING' state for the active profile.
     const { data: matches, error } = await db
       .from('matches')
       .select('*')
+      .eq('profile_id', profileId)
       .in('status', ['RECORDING', 'UPLOADING'])
 
     if (error) throw error

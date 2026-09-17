@@ -74,7 +74,7 @@ class FFmpegService {
 
     const ffmpegPath = this.getFFmpegPath()
     console.log(`Starting FFmpeg recording using: ${ffmpegPath}`)
-    console.log(`Input RTSP: ${rtspUrl}`)
+    console.log('Starting recording from the configured local RTSP source.')
     console.log(`Output: ${outputFilePath}`)
 
     const args = [
@@ -157,7 +157,11 @@ class FFmpegService {
               onError?.(new Error('Recording was manually stopped and file is empty or corrupted.'))
             }
           } else {
-            onError?.(new Error(`FFmpeg process exited with code ${code}. Error log:\n${errorLog}`))
+            onError?.(
+              new Error(
+                `FFmpeg process exited with code ${code}. Error log:\n${this.redactRtspUrls(errorLog)}`
+              )
+            )
           }
         }
       })
@@ -205,6 +209,10 @@ class FFmpegService {
    */
   public getActiveCount(): number {
     return this.activeProcesses.size
+  }
+
+  private redactRtspUrls(value: string): string {
+    return value.replace(/rtsp:\/\/[^\s"'<>]+/gi, 'rtsp://[redacted]')
   }
 
   /**

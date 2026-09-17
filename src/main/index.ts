@@ -31,6 +31,7 @@ import { ffmpegService } from './services/ffmpeg.service'
 import { r2Service } from './services/r2.service'
 import { schedulerService } from './services/scheduler.service'
 import { discoveryService } from './services/discovery.service'
+import { localCourtService } from './services/local-court.service'
 
 function createWindow(): void {
   // Create the browser window.
@@ -81,9 +82,22 @@ function registerIpcHandlers(): void {
     return { success: true }
   })
 
-  // Set Auth Token for DB Service
-  ipcMain.handle('session:set-token', (_, token: string | null) => {
-    dbService.setAccessToken(token)
+  // Set Auth Token and active profile for DB and scheduler services
+  ipcMain.handle(
+    'session:set-token',
+    (_, token: string | null, profileId?: string | null) => {
+      dbService.setAccessToken(token, profileId)
+      if (token === null) {
+        schedulerService.sessionClosed()
+      } else {
+        schedulerService.sessionTokenUpdated(profileId ?? dbService.getProfileId())
+      }
+      return { success: true }
+    }
+  )
+
+  ipcMain.handle('session:ready', () => {
+    schedulerService.sessionReady()
     return { success: true }
   })
 
@@ -123,19 +137,26 @@ function registerIpcHandlers(): void {
     }
   })
 
-  // Court specific RTSP URLs
-  ipcMain.handle('config:get-rtsp', (_, courtId: string) => {
+  // Court-specific RTSP URLs are stored only in the local vault.
+  ipcMain.handle('config:get-rtsp', (_, courtId: string, profileId: string) => {
+    if (!localCourtService.getById(courtId, profileId)) return ''
     return vaultService.getSecret(`RTSP_URL_${courtId}`) || ''
   })
 
-  ipcMain.handle('config:save-rtsp', (_, courtId: string, url: string) => {
-    try {
-      vaultService.setSecret(`RTSP_URL_${courtId}`, url)
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: (error as Error).message }
+  ipcMain.handle(
+    'config:save-rtsp',
+    (_, courtId: string, url: string, profileId: string) => {
+      try {
+        if (!localCourtService.getById(courtId, profileId)) {
+          throw new Error('La cancha local no existe o no pertenece al usuario actual.')
+        }
+        vaultService.setSecret(`RTSP_URL_${courtId}`, url.trim())
+        return { success: true }
+      } catch (error) {
+        return { success: false, error: (error as Error).message }
+      }
     }
-  })
+  )
 
   // Get signed video URL from R2
   ipcMain.handle('config:get-signed-url', async (_, key: string, forDownload?: boolean) => {
@@ -240,90 +261,162 @@ function registerIpcHandlers(): void {
     }
   })
 
-  // 6. DB operations routed from frontend to protect credentials and use service key
-  ipcMain.handle('db:get-courts', async () => {
+  // 6. Local court operations. These handlers never use the Supabase courts table.
+  ipcMain.handle('courts:list', (_, profileId: string) => {
     try {
-      const db = dbService.getClient()
-      const { data, error } = await db.from('courts').select('*').order('name', { ascending: true })
-      if (error) throw error
-      return { success: true, data }
+      return { success: true, data: localCourtService.list(profileId) }
     } catch (error) {
-      console.error('db:get-courts error:', error)
+      console.error('courts:list error:', error)
       return { success: false, error: (error as Error).message }
     }
   })
 
-  ipcMain.handle('db:create-court', async (_, name: string, rtspUrlKey: string, profileId: string) => {
+  ipcMain.handle('courts:get', (_, courtId: string, profileId: string) => {
     try {
+      return { success: true, data: localCourtService.getById(courtId, profileId) }
+    } catch (error) {
+      console.error('courts:get error:', error)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle(
+    'courts:create',
+    (_, input: { name: string; rtspUrl?: string; profileId: string; isDvr?: boolean }) => {
+      let court: ReturnType<typeof localCourtService.create> | null = null
+      try {
+        court = localCourtService.create(input.name, input.profileId, input.isDvr)
+        if (input.rtspUrl?.trim()) {
+          vaultService.setSecret(`RTSP_URL_${court.id}`, input.rtspUrl.trim())
+        }
+        return { success: true, data: court }
+      } catch (error) {
+        if (court) localCourtService.delete(court.id, input.profileId)
+        console.error('courts:create error:', error)
+        return { success: false, error: (error as Error).message }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'courts:update',
+    (
+      _,
+      input: {
+        courtId: string
+        profileId: string
+        name?: string
+        rtspUrl?: string
+        isDvr?: boolean
+      }
+    ) => {
+      try {
+        const court = localCourtService.update(input.courtId, input.profileId, {
+          name: input.name,
+          is_dvr: input.isDvr
+        })
+        if (input.rtspUrl !== undefined) {
+          vaultService.setSecret(`RTSP_URL_${court.id}`, input.rtspUrl.trim())
+        }
+        return { success: true, data: court }
+      } catch (error) {
+        console.error('courts:update error:', error)
+        return { success: false, error: (error as Error).message }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'courts:delete',
+    async (_, input: { courtId: string; profileId: string }) => {
+      try {
+        if (!localCourtService.getById(input.courtId, input.profileId)) {
+          throw new Error('La cancha local no existe o no pertenece al usuario actual.')
+        }
+
+        const db = dbService.getClient()
+        const { data: activeMatches, error } = await db
+          .from('matches')
+          .select('id, status')
+          .eq('court_id', input.courtId)
+          .in('status', ['SCHEDULED', 'RECORDING'])
+
+        if (error) throw error
+        if (activeMatches && activeMatches.length > 0) {
+          const hasRecording = activeMatches.some((match) => match.status === 'RECORDING')
+          throw new Error(
+            hasRecording
+              ? 'No se puede eliminar una cancha mientras tiene una grabación activa.'
+              : 'No se puede eliminar una cancha con partidos programados. Cancela o reasigna esos partidos primero.'
+          )
+        }
+
+        const deleted = localCourtService.delete(input.courtId, input.profileId)
+        return deleted
+          ? { success: true }
+          : { success: false, error: 'La cancha local no existe o ya fue eliminada.' }
+      } catch (error) {
+        console.error('courts:delete error:', error)
+        return { success: false, error: (error as Error).message }
+      }
+    }
+  )
+
+  // Read the cloud courts table only once per profile to migrate legacy installations.
+  ipcMain.handle('courts:migrate', async (_, profileId: string) => {
+    try {
+      if (!localCourtService.needsCloudMigration(profileId)) {
+        return { success: true, migrated: false, data: localCourtService.list(profileId) }
+      }
+
       const db = dbService.getClient()
       const { data, error } = await db
         .from('courts')
-        .insert([{ name, rtsp_url_key: rtspUrlKey, profile_id: profileId }])
-        .select()
+        .select('id, name, created_at, rtsp_url_key')
+        .eq('profile_id', profileId)
+        .order('name', { ascending: true })
+
       if (error) throw error
-      return { success: true, data }
-    } catch (error) {
-      console.error('db:create-court error:', error)
-      return { success: false, error: (error as Error).message }
-    }
-  })
 
-  ipcMain.handle('db:delete-court', async (_, courtId: string) => {
-    try {
-      const db = dbService.getClient()
-      
-      // Before deleting the court, find all matches associated with it that have videos in R2
-      const { data: matches } = await db
-        .from('matches')
-        .select('video_key')
-        .eq('court_id', courtId)
-        .not('video_key', 'is', null)
-
-      // Delete the orphaned videos from R2 to prevent them from taking up space
-      if (matches && matches.length > 0) {
-        console.log(`Found ${matches.length} matches with videos to delete from R2 before court deletion.`)
-        for (const match of matches) {
-          if (match.video_key) {
-            await r2Service.deleteVideo(match.video_key).catch(err => 
-              console.error(`Failed to cleanup video ${match.video_key} for court deletion:`, err)
-            )
-          }
-        }
+      const migration = localCourtService.migrateFromCloud(profileId, data || [])
+      return {
+        success: true,
+        migrated: true,
+        ...migration,
+        data: localCourtService.list(profileId)
       }
-
-      // Now it's safe to let Postgres ON DELETE CASCADE remove the match records
-      const { data, error } = await db.from('courts').delete().eq('id', courtId).select()
-      if (error) throw error
-
-      // Clean up the local RTSP URL secret associated with this court
-      vaultService.deleteSecret(`RTSP_URL_${courtId}`)
-
-      return { success: true, data }
     } catch (error) {
-      console.error('db:delete-court error:', error)
+      console.error('courts:migrate error:', error)
       return { success: false, error: (error as Error).message }
     }
   })
 
-  ipcMain.handle('db:get-matches', async () => {
+  ipcMain.handle('db:get-matches', async (_, profileId: string) => {
     try {
       const db = dbService.getClient()
       // Fetch matches within the retention window (default 30 days)
       // This ensures videos are visible in the library until they are auto-deleted.
       const retentionDaysStr = vaultService.getSecret('VIDEO_RETENTION_DAYS') || '30'
       const retentionDays = parseInt(retentionDaysStr, 10)
-      
+
       const cutoff = new Date()
       cutoff.setDate(cutoff.getDate() - (retentionDays > 0 ? retentionDays : 30))
       cutoff.setHours(0, 0, 0, 0)
 
       const { data, error } = await db
         .from('matches')
-        .select('*, courts(name)')
+        .select('*')
+        .eq('profile_id', profileId)
         .gte('start_time', cutoff.toISOString())
         .order('start_time', { ascending: true })
       if (error) throw error
-      return { success: true, data }
+
+      const matches = (data || []).map((match) => ({
+        ...match,
+        court_name:
+          match.court_name || localCourtService.getById(match.court_id, profileId)?.name || null
+      }))
+      return { success: true, data: matches }
     } catch (error) {
       console.error('db:get-matches error:', error)
       return { success: false, error: (error as Error).message }
@@ -344,12 +437,18 @@ function registerIpcHandlers(): void {
       profileId: string
     ) => {
       try {
+        const court = localCourtService.getById(match.court_id, profileId)
+        if (!court) {
+          throw new Error('La cancha seleccionada no existe en el almacenamiento local.')
+        }
+
         const db = dbService.getClient()
         const { data, error } = await db
           .from('matches')
           .insert([
             {
-              court_id: match.court_id,
+              court_id: court.id,
+              court_name: court.name,
               start_time: match.start_time,
               end_time: match.end_time,
               player_name: match.player_name,
@@ -368,13 +467,18 @@ function registerIpcHandlers(): void {
     }
   )
 
-  ipcMain.handle('db:delete-match', async (_, matchId: string) => {
+  ipcMain.handle('db:delete-match', async (_, matchId: string, profileId: string) => {
     try {
       const db = dbService.getClient()
-      
+
       // Fetch match to get video_key
-      const { data: match } = await db.from('matches').select('video_key').eq('id', matchId).single()
-      
+      const { data: match } = await db
+        .from('matches')
+        .select('video_key')
+        .eq('id', matchId)
+        .eq('profile_id', profileId)
+        .single()
+
       if (match?.video_key) {
         try {
           await r2Service.deleteVideo(match.video_key)
@@ -394,7 +498,11 @@ function registerIpcHandlers(): void {
         console.error(`Error deleting local file for match ${matchId}:`, err)
       }
 
-      const { error } = await db.from('matches').delete().eq('id', matchId)
+      const { error } = await db
+        .from('matches')
+        .delete()
+        .eq('id', matchId)
+        .eq('profile_id', profileId)
       if (error) throw error
       return { success: true }
     } catch (error) {
@@ -501,7 +609,7 @@ function registerIpcHandlers(): void {
 
   // 11. Live Camera Streaming handlers (RTSP -> JSMpeg / IPC)
   ipcMain.handle('stream:start', (event, { courtId, rtspUrl }) => {
-    console.log(`[IPC] stream:start requested for court ${courtId} with RTSP URL: ${rtspUrl}`)
+    console.log(`[IPC] stream:start requested for court ${courtId}.`)
     if (activeStreams.has(courtId)) {
       console.log(`[IPC] Stream for court ${courtId} is already active.`)
       return { success: true, message: 'Stream already active' }
@@ -529,7 +637,7 @@ function registerIpcHandlers(): void {
         '-'
       ]
 
-      console.log(`[IPC] Spawning FFmpeg stream process: ${ffmpegPath} ${args.join(' ')}`)
+      console.log(`[IPC] Spawning FFmpeg stream process for court ${courtId}.`)
       const proc = spawn(ffmpegPath, args)
       activeStreams.set(courtId, proc)
 
@@ -548,9 +656,8 @@ function registerIpcHandlers(): void {
         }
       })
 
-      proc.stderr.on('data', (data) => {
-        // Keep a log of FFmpeg stderr to debug connection or codec issues
-        console.log(`[FFmpeg Stream ${courtId} Stderr]:`, data.toString().trim())
+      proc.stderr.on('data', () => {
+        // Do not log FFmpeg stderr because it can contain RTSP credentials.
       })
 
       proc.on('close', (code) => {

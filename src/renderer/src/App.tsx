@@ -32,13 +32,17 @@ import { supabase } from './lib/supabase'
 interface Court {
   id: string
   name: string
-  rtsp_url_key: string
   created_at: string
+  updated_at: string
+  profile_id: string
+  is_dvr: boolean
 }
 
 interface Match {
   id: string
   court_id: string
+  court_name: string | null
+  profile_id: string | null
   start_time: string
   end_time: string
   status: 'SCHEDULED' | 'RECORDING' | 'UPLOADING' | 'DONE' | 'FAILED'
@@ -46,9 +50,6 @@ interface Match {
   player_phone: string
   player_name: string
   error_log: string | null
-  courts?: {
-    name: string
-  }
 }
 
 interface ActiveRecording {
@@ -286,6 +287,7 @@ function App(): React.JSX.Element {
   // Modal open states
   const [isCreateCourtModalOpen, setIsCreateCourtModalOpen] = useState<boolean>(false)
   const [isScanModalOpen, setIsScanModalOpen] = useState<boolean>(false)
+  const [courtToEdit, setCourtToEdit] = useState<Court | null>(null)
   const [courtToDelete, setCourtToDelete] = useState<Court | null>(null)
 
   // Modal open states for Videos
@@ -384,7 +386,11 @@ function App(): React.JSX.Element {
   useEffect(() => {
     const { data: authListener } = supabase.auth.onAuthStateChange(async (_event, session) => {
       if (session?.access_token && window.electron) {
-        await window.electron.ipcRenderer.invoke('session:set-token', session.access_token)
+        await window.electron.ipcRenderer.invoke(
+          'session:set-token',
+          session.access_token,
+          session.user.id
+        )
       }
     })
 
@@ -401,7 +407,11 @@ function App(): React.JSX.Element {
     
     // Set token in Main Process so dbService uses the Anon Key with RLS
     if (window.electron) {
-      await window.electron.ipcRenderer.invoke('session:set-token', session.access_token)
+      await window.electron.ipcRenderer.invoke(
+        'session:set-token',
+        session.access_token,
+        session.user.id
+      )
     }
     
     // Check user profile for configuration status
@@ -444,24 +454,37 @@ function App(): React.JSX.Element {
         window.electron.ipcRenderer.send('window:set-title', `ViewPadel - ${name}`)
       }
       
-      // If configured, fetch config from DB and save it to the local vault securely!
+      // If configured, fetch cloud config and migrate legacy courts into local storage once.
       if (profile.is_configured) {
         const { data: clientConfig } = await supabase
           .from('client_configs')
           .select('*')
           .eq('profile_id', session.user.id)
           .single()
-          
-        if (clientConfig) {
-          if (window.electron) {
-            await window.electron.ipcRenderer.invoke('config:save', {
-              R2_BUCKET_NAME: clientConfig.r2_bucket_name,
-              R2_ACCESS_KEY_ID: clientConfig.r2_access_key_id,
-              R2_SECRET_ACCESS_KEY: clientConfig.r2_secret_access_key,
-              R2_ENDPOINT: clientConfig.r2_endpoint
-            })
+
+        if (clientConfig && window.electron) {
+          await window.electron.ipcRenderer.invoke('config:save', {
+            R2_BUCKET_NAME: clientConfig.r2_bucket_name,
+            R2_ACCESS_KEY_ID: clientConfig.r2_access_key_id,
+            R2_SECRET_ACCESS_KEY: clientConfig.r2_secret_access_key,
+            R2_ENDPOINT: clientConfig.r2_endpoint
+          })
+        }
+
+        if (window.electron) {
+          const migrationRes = await window.electron.ipcRenderer.invoke(
+            'courts:migrate',
+            session.user.id
+          )
+          if (!migrationRes.success) {
+            console.error('Local court migration failed:', migrationRes.error)
+            showToast(`No se pudieron migrar las canchas existentes: ${migrationRes.error}`, 'error')
           }
-          fetchData()
+
+          await fetchData(session.user.id)
+          if (migrationRes.success) {
+            await window.electron.ipcRenderer.invoke('session:ready')
+          }
         }
       }
     } else {
@@ -633,9 +656,10 @@ function App(): React.JSX.Element {
   }, [])
 
   // Fetch all initial data
-  const fetchData = async () => {
+  const fetchData = async (profileId?: string) => {
     setLoadingDb(true)
     try {
+      const activeProfileId = profileId || sessionUser?.id
       // Check FFmpeg
       if (window.electron) {
         const ffmpeg = await window.electron.ipcRenderer.invoke('ffmpeg:check')
@@ -689,29 +713,32 @@ function App(): React.JSX.Element {
         }
       }
 
-      // Load database records
-      if (window.electron) {
-        const courtsRes = await window.electron.ipcRenderer.invoke('db:get-courts')
+      // Load local courts and cloud matches for the active profile.
+      if (window.electron && activeProfileId) {
+        const courtsRes = await window.electron.ipcRenderer.invoke('courts:list', activeProfileId)
         if (courtsRes.success) {
           setCourts(courtsRes.data)
           if (courtsRes.data.length > 0 && !newMatch.court_id) {
             setNewMatch((prev) => ({ ...prev, court_id: courtsRes.data[0].id }))
           }
 
-          // Fetch RTSP urls for courts
           const rtspDict: Record<string, string> = {}
-          for (const c of courtsRes.data) {
-            const url = await window.electron.ipcRenderer.invoke('config:get-rtsp', c.id)
-            rtspDict[c.id] = url || c.rtsp_url_key
+          for (const court of courtsRes.data) {
+            rtspDict[court.id] = await window.electron.ipcRenderer.invoke(
+              'config:get-rtsp',
+              court.id,
+              activeProfileId
+            )
           }
           setCourtRtspUrls(rtspDict)
         } else {
-          if (courtsRes.error.includes('configuration missing')) {
-            setConfigError('Por favor configura Supabase y Cloudflare R2 para comenzar.')
-          }
+          console.error(courtsRes.error)
         }
 
-        const matchesRes = await window.electron.ipcRenderer.invoke('db:get-matches')
+        const matchesRes = await window.electron.ipcRenderer.invoke(
+          'db:get-matches',
+          activeProfileId
+        )
         if (matchesRes.success) {
           setMatches(matchesRes.data)
         } else {
@@ -781,7 +808,12 @@ function App(): React.JSX.Element {
   const handleSaveCourtRtsp = async (courtId: string, url: string) => {
     if (!window.electron) return
     console.info(`[User Action] Guardando URL RTSP para la cancha: ${courtId}`)
-    const res = await window.electron.ipcRenderer.invoke('config:save-rtsp', courtId, url)
+    const res = await window.electron.ipcRenderer.invoke(
+      'config:save-rtsp',
+      courtId,
+      url,
+      sessionUser?.id
+    )
     if (res.success) {
       console.info(`[User Action Success] URL guardada exitosamente para la cancha: ${courtId}`)
       setCourtRtspUrls((prev) => ({ ...prev, [courtId]: url }))
@@ -798,12 +830,11 @@ function App(): React.JSX.Element {
     if (!newCourt.name || !window.electron) return
 
     console.info(`[User Action] Intentando crear nueva cancha: ${newCourt.name}`)
-    const res = await window.electron.ipcRenderer.invoke(
-      'db:create-court',
-      newCourt.name,
-      newCourt.rtsp_url,
-      sessionUser?.id
-    )
+    const res = await window.electron.ipcRenderer.invoke('courts:create', {
+      name: newCourt.name,
+      rtspUrl: newCourt.rtsp_url,
+      profileId: sessionUser?.id
+    })
     if (res.success) {
       console.info(`[User Action Success] Cancha creada exitosamente: ${newCourt.name}`)
       showToast('Cancha agregada exitosamente.', 'success')
@@ -815,11 +846,37 @@ function App(): React.JSX.Element {
     }
   }
 
+  // Update existing local court metadata and its local RTSP secret.
+  const handleUpdateCourt = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!courtToEdit || !newCourt.name || !window.electron) return
+
+    const res = await window.electron.ipcRenderer.invoke('courts:update', {
+      courtId: courtToEdit.id,
+      name: newCourt.name,
+      rtspUrl: newCourt.rtsp_url,
+      profileId: sessionUser?.id
+    })
+
+    if (res.success) {
+      showToast('Cancha actualizada correctamente.', 'success')
+      setCourtToEdit(null)
+      setIsCreateCourtModalOpen(false)
+      setNewCourt({ name: '', rtsp_url: '' })
+      fetchData(sessionUser?.id)
+    } else {
+      showToast(`Error al actualizar la cancha: ${res.error}`, 'error')
+    }
+  }
+
   // Delete existing court
   const handleDeleteCourt = async (courtId: string) => {
     if (!window.electron) return
     console.info(`[User Action] Intentando eliminar la cancha ID: ${courtId}`)
-    const res = await window.electron.ipcRenderer.invoke('db:delete-court', courtId)
+    const res = await window.electron.ipcRenderer.invoke('courts:delete', {
+      courtId,
+      profileId: sessionUser?.id
+    })
     if (res.success) {
       console.info(`[User Action Success] Cancha ID ${courtId} eliminada exitosamente.`)
       showToast('Cancha eliminada exitosamente.', 'success')
@@ -911,7 +968,11 @@ function App(): React.JSX.Element {
   const handleDeleteMatch = async (matchId: string) => {
     if (!confirm('¿Estás seguro de que deseas eliminar este partido?') || !window.electron) return
     console.info(`[User Action] Eliminando partido ID: ${matchId}`)
-    const res = await window.electron.ipcRenderer.invoke('db:delete-match', matchId)
+    const res = await window.electron.ipcRenderer.invoke(
+      'db:delete-match',
+      matchId,
+      sessionUser?.id
+    )
     if (res.success) {
       console.info(`[User Action Success] Partido eliminado correctamente ID: ${matchId}`)
       showToast('Partido eliminado.', 'success')
@@ -1289,7 +1350,7 @@ function App(): React.JSX.Element {
               {clubName} - {profileName}
             </div>
           </div>
-          <button className="btn btn-secondary btn-icon" onClick={fetchData} disabled={loadingDb}>
+          <button className="btn btn-secondary btn-icon" onClick={() => fetchData()} disabled={loadingDb}>
             <RefreshCw size={16} className={loadingDb ? 'spin' : ''} />
             <span>Sincronizar</span>
           </button>
@@ -1452,7 +1513,7 @@ function App(): React.JSX.Element {
                                 <div style={{ marginBottom: '12px' }}>
                                   <LiveCourtStream
                                     courtId={court.id}
-                                    rtspUrl={courtRtspUrls[court.id] || court.rtsp_url_key}
+                                    rtspUrl={courtRtspUrls[court.id] || ''}
                                   />
                                 </div>
                               )}
@@ -1533,7 +1594,7 @@ function App(): React.JSX.Element {
                               <div className="upload-info">
                                 <div>
                                   <h4>{match.player_name}</h4>
-                                  <p className="text-muted text-xs">Cancha: {match.courts?.name}</p>
+                                  <p className="text-muted text-xs">Cancha: {match.court_name || 'Cancha Registrada'}</p>
                                 </div>
                                 <span className="font-mono text-sm">{percent}%</span>
                               </div>
@@ -1583,7 +1644,7 @@ function App(): React.JSX.Element {
                         matches.map((match) => (
                           <tr key={match.id}>
                             <td>
-                              <strong>{match.courts?.name}</strong>
+                              <strong>{match.court_name || 'Cancha Registrada'}</strong>
                             </td>
                             <td>
                               <div>{match.player_name}</div>
@@ -1771,7 +1832,7 @@ function App(): React.JSX.Element {
                         </div>
                         <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
                           <span className="info-label text-secondary text-sm">Cancha:</span>
-                          <span className="info-value font-medium">{infoMatch.courts?.name}</span>
+                          <span className="info-value font-medium">{infoMatch.court_name || 'Cancha Registrada'}</span>
                         </div>
                         <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
                           <span className="info-label text-secondary text-sm">Fecha y Hora:</span>
@@ -1920,7 +1981,7 @@ function App(): React.JSX.Element {
                           .map((match) => (
                             <tr key={match.id}>
                               <td>
-                                <strong>{match.courts?.name}</strong>
+                                <strong>{match.court_name || 'Cancha Registrada'}</strong>
                               </td>
                               <td>{match.player_name}</td>
                               <td>
@@ -1972,7 +2033,11 @@ function App(): React.JSX.Element {
                 </h3>
                 <button
                   className="btn btn-primary btn-sm"
-                  onClick={() => setIsCreateCourtModalOpen(true)}
+                  onClick={() => {
+                    setCourtToEdit(null)
+                    setNewCourt({ name: '', rtsp_url: '' })
+                    setIsCreateCourtModalOpen(true)
+                  }}
                 >
                   <Plus size={16} style={{ marginRight: '6px' }} />
                   Registrar Cancha
@@ -1985,7 +2050,11 @@ function App(): React.JSX.Element {
                   <p>No hay canchas configuradas en este club.</p>
                   <button
                     className="btn btn-primary btn-sm"
-                    onClick={() => setIsCreateCourtModalOpen(true)}
+                    onClick={() => {
+                      setCourtToEdit(null)
+                      setNewCourt({ name: '', rtsp_url: '' })
+                      setIsCreateCourtModalOpen(true)
+                    }}
                   >
                     Registrar Primera Cancha
                   </button>
@@ -2071,6 +2140,22 @@ function App(): React.JSX.Element {
                                   </button>
                                   <button
                                     type="button"
+                                    className="dropdown-item"
+                                    disabled={isRecording}
+                                    onClick={() => {
+                                      setOpenDropdownCourtId(null)
+                                      setCourtToEdit(court)
+                                      setNewCourt({
+                                        name: court.name,
+                                        rtsp_url: courtRtspUrls[court.id] || ''
+                                      })
+                                      setIsCreateCourtModalOpen(true)
+                                    }}
+                                  >
+                                    <Settings size={12} /> Editar cancha
+                                  </button>
+                                  <button
+                                    type="button"
                                     className="dropdown-item text-danger"
                                     disabled={isRecording}
                                     onClick={() => {
@@ -2105,24 +2190,39 @@ function App(): React.JSX.Element {
 
               {/* POPUP MODAL FOR COURT REGISTRATION */}
               {isCreateCourtModalOpen && (
-                <div className="modal-overlay" onClick={() => setIsCreateCourtModalOpen(false)}>
+                <div
+                  className="modal-overlay"
+                  onClick={() => {
+                    setCourtToEdit(null)
+                    setNewCourt({ name: '', rtsp_url: '' })
+                    setIsCreateCourtModalOpen(false)
+                  }}
+                >
                   <div className="modal-content" onClick={(e) => e.stopPropagation()}>
                     <button
                       className="modal-close-btn"
-                      onClick={() => setIsCreateCourtModalOpen(false)}
+                      onClick={() => {
+                        setCourtToEdit(null)
+                        setNewCourt({ name: '', rtsp_url: '' })
+                        setIsCreateCourtModalOpen(false)
+                      }}
                       type="button"
                     >
                       <XCircle size={20} />
                     </button>
 
                     <h3 className="card-title" style={{ marginBottom: '20px' }}>
-                      Registrar Nueva Cancha
+                      {courtToEdit ? 'Editar Cancha' : 'Registrar Nueva Cancha'}
                     </h3>
                     <form
-                      onSubmit={async (e) => {
-                        await handleCreateCourt(e)
-                        setIsCreateCourtModalOpen(false)
-                      }}
+                      onSubmit={
+                        courtToEdit
+                          ? handleUpdateCourt
+                          : async (e) => {
+                              await handleCreateCourt(e)
+                              setIsCreateCourtModalOpen(false)
+                            }
+                      }
                       className="form-grid"
                     >
                       <div className="form-group">
@@ -2137,7 +2237,7 @@ function App(): React.JSX.Element {
                       </div>
 
                       <div className="form-group">
-                        <label>Stream RTSP por Defecto</label>
+                        <label>Stream RTSP local</label>
                         <div className="rtsp-input-wrapper">
                           <input
                             type="text"
@@ -2185,7 +2285,7 @@ function App(): React.JSX.Element {
                         className="btn btn-primary btn-block"
                         style={{ marginTop: '16px' }}
                       >
-                        Registrar Cancha
+                        {courtToEdit ? 'Guardar Cambios' : 'Registrar Cancha'}
                       </button>
                     </form>
                   </div>
@@ -2233,9 +2333,9 @@ function App(): React.JSX.Element {
                         style={{ margin: 0, fontSize: '0.85rem', lineHeight: '1.4' }}
                         className="text-danger"
                       >
-                        <strong>Atención:</strong> Esta acción es irreversible. Se eliminarán
-                        permanentemente todos los partidos, grabaciones y programaciones asociadas a
-                        esta cancha.
+                        <strong>Atención:</strong> Se eliminará la configuración local y el RTSP de
+                        esta cancha. Los partidos históricos y sus videos se conservarán. Los partidos
+                        programados deben cancelarse antes de eliminarla.
                       </p>
                     </div>
 
