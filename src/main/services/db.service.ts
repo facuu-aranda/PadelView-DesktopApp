@@ -4,10 +4,20 @@ import { vaultService } from './vault.service'
 class DbService {
   private clientInstance: SupabaseClient | null = null
   private currentAccessToken: string | null = null
+  private currentProfileId: string | null = null
 
-  public setAccessToken(token: string | null) {
+  public setAccessToken(token: string | null, profileId?: string | null) {
     this.currentAccessToken = token
+    if (token === null) {
+      this.currentProfileId = null
+    } else if (profileId !== undefined) {
+      this.currentProfileId = profileId
+    }
     this.clientInstance = null // force recreate
+  }
+
+  public getProfileId(): string | null {
+    return this.currentProfileId
   }
 
   /**

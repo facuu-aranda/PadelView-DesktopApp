@@ -6,10 +6,14 @@ import { dbService } from './db.service'
 import { ffmpegService } from './ffmpeg.service'
 import { r2Service } from './r2.service'
 import { vaultService } from './vault.service'
+import { localCourtService } from './local-court.service'
+import { videoSourceResolver } from './video-source-resolver.service'
 
 export interface Match {
   id: string
   court_id: string
+  court_name?: string | null
+  profile_id?: string | null
   start_time: string
   end_time: string
   status: 'SCHEDULED' | 'RECORDING' | 'UPLOADING' | 'DONE' | 'FAILED'
@@ -22,8 +26,11 @@ export interface Match {
 class SchedulerService {
   private timer: NodeJS.Timeout | null = null
   private isProcessing = false
+  private isSessionReady = false
+  private readyProfileId: string | null = null
   private tempDir: string
   private lastCleanupTime: number = 0
+  private onDemandStarts = new Map<string, Promise<{ match: Match; alreadyActive: boolean }>>()
 
   constructor() {
     this.tempDir = path.join(app.getPath('userData'), 'temp_recordings')
@@ -64,11 +71,34 @@ class SchedulerService {
     }
   }
 
+  public sessionTokenUpdated(profileId: string | null): void {
+    if (!profileId || this.readyProfileId !== profileId) {
+      this.isSessionReady = false
+      this.readyProfileId = profileId
+    }
+  }
+
+  public sessionClosed(): void {
+    this.isSessionReady = false
+    this.readyProfileId = null
+  }
+
+  public sessionReady(): void {
+    this.isSessionReady = true
+    this.readyProfileId = dbService.getProfileId()
+    this.recoverOrphanedMatches().catch((err) => {
+      console.error('Error during session recovery:', err)
+    })
+    this.tick().catch((err) => {
+      console.error('Error during session scheduler tick:', err)
+    })
+  }
+
   /**
    * Main scheduler tick logic.
    */
   private async tick(): Promise<void> {
-    if (this.isProcessing) return
+    if (this.isProcessing || !this.isSessionReady || !dbService.getProfileId()) return
 
     // Verify client configurations exist before making queries
     try {
@@ -83,6 +113,9 @@ class SchedulerService {
 
     try {
       const now = new Date()
+      const profileId = dbService.getProfileId()
+      if (!profileId) return
+
       const db = dbService.getClient()
 
       // 1. Fetch scheduled matches starting soon (e.g. within next 2 hours or already passed)
@@ -90,6 +123,7 @@ class SchedulerService {
       const { data: matches, error } = await db
         .from('matches')
         .select('*')
+        .eq('profile_id', profileId)
         .eq('status', 'SCHEDULED')
         .order('start_time', { ascending: true })
 
@@ -145,36 +179,137 @@ class SchedulerService {
     }
   }
 
+  public async startRecordingOnDemand(
+    courtId: string,
+    profileId: string
+  ): Promise<{ match: Match; alreadyActive: boolean }> {
+    const lockKey = `${profileId}:${courtId}`
+    const pending = this.onDemandStarts.get(lockKey)
+    if (pending) return pending
+
+    const operation = this.createAndStartOnDemandRecording(courtId, profileId)
+    this.onDemandStarts.set(lockKey, operation)
+    try {
+      return await operation
+    } finally {
+      if (this.onDemandStarts.get(lockKey) === operation) this.onDemandStarts.delete(lockKey)
+    }
+  }
+
+  private async createAndStartOnDemandRecording(
+    courtId: string,
+    profileId: string
+  ): Promise<{ match: Match; alreadyActive: boolean }> {
+    const court = localCourtService.getById(courtId, profileId)
+    if (!court) throw new Error('La cancha seleccionada no existe en el almacenamiento local.')
+
+    const db = dbService.getClient()
+    const now = new Date()
+    const endTime = new Date(now.getTime() + 90 * 60000)
+    const { data: activeMatches, error: activeError } = await db
+      .from('matches')
+      .select('*')
+      .eq('court_id', courtId)
+      .eq('profile_id', profileId)
+      .in('status', ['SCHEDULED', 'RECORDING', 'UPLOADING'])
+      .order('start_time', { ascending: true })
+
+    if (activeError) throw activeError
+
+    const existingManual = (activeMatches || []).find(
+      (match) => match.player_name === 'Grabación Manual'
+    ) as Match | undefined
+    if (existingManual) {
+      if (existingManual.status === 'SCHEDULED') {
+        const { data: claimedMatch, error } = await db
+          .from('matches')
+          .update({ status: 'RECORDING', error_log: null })
+          .eq('id', existingManual.id)
+          .eq('status', 'SCHEDULED')
+          .select()
+          .maybeSingle()
+        if (error) throw error
+        if (!claimedMatch) {
+          const { data: currentMatch, error: currentError } = await db
+            .from('matches')
+            .select('*')
+            .eq('id', existingManual.id)
+            .maybeSingle()
+          if (currentError) throw currentError
+          if (currentMatch) return { match: currentMatch as Match, alreadyActive: true }
+          throw new Error('La grabación manual dejó de estar disponible.')
+        }
+        const startedMatch = claimedMatch as Match
+        await this.processRecordingStart(startedMatch, now, endTime, true)
+        return { match: startedMatch, alreadyActive: true }
+      }
+      return { match: existingManual, alreadyActive: true }
+    }
+
+    if (activeMatches && activeMatches.length > 0) {
+      throw new Error('La cancha ya tiene un partido programado o una grabación activa.')
+    }
+
+    const { data, error } = await db
+      .from('matches')
+      .insert({
+        court_id: court.id,
+        court_name: court.name,
+        start_time: now.toISOString(),
+        end_time: endTime.toISOString(),
+        player_name: 'Grabación Manual',
+        player_phone: '+5490000000000',
+        status: 'RECORDING',
+        profile_id: profileId
+      })
+      .select()
+      .single()
+
+    if (error || !data) throw error || new Error('No se pudo crear la grabación manual.')
+    const match = data as Match
+    await this.processRecordingStart(match, now, endTime, true)
+    return { match, alreadyActive: false }
+  }
+
   /**
    * Handle starting a recording session.
    */
-  private async processRecordingStart(match: Match, now: Date, endTime: Date): Promise<void> {
+  private async processRecordingStart(
+    match: Match,
+    now: Date,
+    endTime: Date,
+    statusAlreadySet = false
+  ): Promise<void> {
     const db = dbService.getClient()
+    const profileId = match.profile_id || dbService.getProfileId()
 
-    // 1. Retrieve court configuration for RTSP URL
-    const { data: court, error: courtErr } = await db
-      .from('courts')
-      .select('*')
-      .eq('id', match.court_id)
-      .single()
-
-    if (courtErr || !court) {
-      console.error(`Court configuration not found for match ${match.id}:`, courtErr)
+    // Resolve the local video source. The scheduler does not know recorder vendors or RTSP paths.
+    const court = profileId ? localCourtService.getById(match.court_id, profileId) : null
+    if (!court || !profileId) {
+      console.error(`Local court configuration not found for match ${match.id}.`)
       await db
         .from('matches')
-        .update({ status: 'FAILED', error_log: `Court config missing: ${courtErr?.message}` })
+        .update({ status: 'FAILED', error_log: 'Local court configuration is missing.' })
         .eq('id', match.id)
+      this.notifyUI('match-updated', match.id)
       return
     }
 
-    // Resolve RTSP URL from vault or default to config
-    let rtspUrl = vaultService.getSecret(`RTSP_URL_${court.id}`) || court.rtsp_url_key
-    if (!rtspUrl) {
-      console.error(`RTSP URL not found for court ${court.id}`)
+    let rtspUrl: string
+    try {
+      const resolvedSource = await videoSourceResolver.resolveVideoSource(
+        court.id,
+        profileId,
+        'recording'
+      )
+      rtspUrl = resolvedSource.recordingUrl
+    } catch (error) {
+      console.error(`Video source resolution failed for match ${match.id}:`, (error as Error).message)
       await db
         .from('matches')
-        .update({ status: 'FAILED', error_log: `RTSP Stream URL is not configured.` })
+        .update({ status: 'FAILED', error_log: 'Video source is unavailable locally.' })
         .eq('id', match.id)
+      this.notifyUI('match-updated', match.id)
       return
     }
 
@@ -185,13 +320,15 @@ class SchedulerService {
     console.log(`Starting recording for match ${match.id}. Duration: ${durationSeconds}s`)
 
     try {
-      // 2. Set status to RECORDING in Supabase
-      const { error: updateErr } = await db
-        .from('matches')
-        .update({ status: 'RECORDING' })
-        .eq('id', match.id)
+      // 2. Set status to RECORDING in Supabase unless an on-demand start already did it.
+      if (!statusAlreadySet) {
+        const { error: updateErr } = await db
+          .from('matches')
+          .update({ status: 'RECORDING' })
+          .eq('id', match.id)
 
-      if (updateErr) throw updateErr
+        if (updateErr) throw updateErr
+      }
       this.notifyUI('match-updated', match.id)
       this.showNotification(
         'Grabación Iniciada',
@@ -317,13 +454,17 @@ class SchedulerService {
       return // Config not set up
     }
 
+    const profileId = dbService.getProfileId()
+    if (!profileId) return
+
     const db = dbService.getClient()
     console.log('Checking for orphaned or interrupted recordings...')
 
-    // Find any matches in 'RECORDING' or 'UPLOADING' state
+    // Find any matches in 'RECORDING' or 'UPLOADING' state for the active profile.
     const { data: matches, error } = await db
       .from('matches')
       .select('*')
+      .eq('profile_id', profileId)
       .in('status', ['RECORDING', 'UPLOADING'])
 
     if (error) throw error
