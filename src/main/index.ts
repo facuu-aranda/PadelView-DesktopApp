@@ -23,6 +23,7 @@ if (process.defaultApp) {
 const gotTheLock = app.requestSingleInstanceLock()
 if (!gotTheLock) {
   app.quit()
+  process.exit(0)
 }
 
 // Services imports
@@ -35,6 +36,7 @@ import { discoveryService } from './services/discovery.service'
 import { localCourtService } from './services/local-court.service'
 import { recorderService } from './services/recorder/recorder.service'
 import { videoSourceResolver } from './services/video-source-resolver.service'
+import { mediaMtxService } from './services/media-mtx.service'
 import type {
   RecorderChannel,
   RecorderSource,
@@ -846,7 +848,32 @@ function registerIpcHandlers(): void {
     }
   })
 
-  // 11. Live source streaming handlers (direct camera or recorder channel -> IPC)
+  // 11. DVR/NVR preview through local MediaMTX + WebRTC.
+  ipcMain.handle(
+    'video-source:preview-start',
+    async (
+      _,
+      input: { source: RecorderSource; profileId: string; profile?: 'main' | 'sub' }
+    ) => {
+      try {
+        const handle = await mediaMtxService.startPreview(input.source, input.profileId, input.profile || 'sub')
+        return { success: true, data: handle }
+      } catch (error) {
+        console.error('video-source:preview-start error:', (error as Error).message)
+        return { success: false, error: (error as Error).message }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'video-source:preview-stop',
+    async (_, handle: { key: string; pathName: string }) => {
+      await mediaMtxService.stopPreview(handle)
+      return { success: true }
+    }
+  )
+
+  // 12. Legacy direct-camera preview. Kept unchanged for DirectCameraSource.
   ipcMain.handle(
     'stream:start',
     async (
@@ -855,10 +882,15 @@ function registerIpcHandlers(): void {
     ) => {
       const { courtId } = input
       console.log(`[IPC] stream:start requested for source ${courtId}.`)
-      if (activeStreams.has(courtId)) {
-      console.log(`[IPC] Stream for court ${courtId} is already active.`)
-      return { success: true, message: 'Stream already active' }
-    }
+      if (activeStreams.has(courtId) || startingStreams.has(courtId)) {
+        cancelledStreamStarts.delete(courtId)
+        activeStreamRefs.set(courtId, (activeStreamRefs.get(courtId) || 0) + 1)
+        console.log(`[IPC] Stream for court ${courtId} is already active or starting.`)
+        return { success: true, message: 'Stream already active' }
+      }
+
+      startingStreams.add(courtId)
+      activeStreamRefs.set(courtId, 1)
 
       try {
         const profileId = input.profileId || dbService.getProfileId()
@@ -869,12 +901,26 @@ function registerIpcHandlers(): void {
             : await videoSourceResolver.resolveVideoSource(courtId, profileId, 'preview')
           rtspUrl = resolved.previewUrl || resolved.recordingUrl
         }
-        if (!rtspUrl) throw new Error('No hay una fuente de video configurada para esta vista previa.')
+          if (!rtspUrl) throw new Error('No hay una fuente de video configurada para esta vista previa.')
+        if (cancelledStreamStarts.has(courtId) || (activeStreamRefs.get(courtId) || 0) === 0) {
+          startingStreams.delete(courtId)
+          cancelledStreamStarts.delete(courtId)
+          activeStreamRefs.delete(courtId)
+          return { success: false, error: 'El preview fue cancelado antes de iniciar.' }
+        }
 
         const ffmpegPath = ffmpegService.getFFmpegPath()
         const args = [
           '-rtsp_transport',
           'tcp',
+          '-analyzeduration',
+          '1000000',
+          '-probesize',
+          '1000000',
+          '-fflags',
+          'nobuffer',
+          '-flags',
+          'low_delay',
           '-i',
           rtspUrl,
         '-f',
@@ -895,6 +941,7 @@ function registerIpcHandlers(): void {
         console.log(`[IPC] Spawning FFmpeg stream process for source ${courtId}.`)
         const proc = spawn(ffmpegPath, args)
         activeStreams.set(courtId, proc)
+        startingStreams.delete(courtId)
 
         const webContents = event.sender
         let chunkCount = 0
@@ -917,6 +964,7 @@ function registerIpcHandlers(): void {
 
         proc.once('error', (error) => {
           activeStreams.delete(courtId)
+          activeStreamRefs.delete(courtId)
           console.error(`[IPC] Failed to start streaming for source ${courtId}:`, error.message)
         })
 
@@ -925,10 +973,13 @@ function registerIpcHandlers(): void {
             `[IPC] FFmpeg stream process for source ${courtId} closed with exit code ${code}`
           )
           activeStreams.delete(courtId)
+          activeStreamRefs.delete(courtId)
         })
 
         return { success: true }
       } catch (error) {
+        startingStreams.delete(courtId)
+        activeStreamRefs.delete(courtId)
         console.error(`[IPC] Failed to start streaming for source ${courtId}:`, (error as Error).message)
         return { success: false, error: (error as Error).message }
       }
@@ -936,12 +987,26 @@ function registerIpcHandlers(): void {
   )
 
   ipcMain.handle('stream:stop', (_, courtId) => {
+    const references = activeStreamRefs.get(courtId) || 0
+    if (references > 1) {
+      activeStreamRefs.set(courtId, references - 1)
+      return { success: true, message: 'Stream remains active for another preview.' }
+    }
+
     const proc = activeStreams.get(courtId)
     if (proc) {
       proc.kill('SIGKILL')
       activeStreams.delete(courtId)
+      activeStreamRefs.delete(courtId)
       return { success: true }
     }
+    if (startingStreams.has(courtId)) {
+      const nextReferences = Math.max(references - 1, 0)
+      activeStreamRefs.set(courtId, nextReferences)
+      if (nextReferences === 0) cancelledStreamStarts.add(courtId)
+      return { success: true, message: 'Stream startup cancellation requested.' }
+    }
+    activeStreamRefs.delete(courtId)
     return { success: false, error: 'No stream active' }
   })
 
@@ -1033,6 +1098,9 @@ app.whenReady().then(() => {
 })
 
 const activeStreams = new Map<string, ChildProcess>()
+const startingStreams = new Set<string>()
+const cancelledStreamStarts = new Set<string>()
+const activeStreamRefs = new Map<string, number>()
 const activeRecorderOperations = new Map<string, AbortController>()
 
 app.on('window-all-closed', () => {
@@ -1046,6 +1114,7 @@ app.on('window-all-closed', () => {
     }
   }
   activeStreams.clear()
+  void mediaMtxService.stop()
 
   if (process.platform !== 'darwin') {
     schedulerService.stop()

@@ -42,7 +42,13 @@ export class RecorderProbeService {
       MAX_CHANNELS
     )
     const numbers = this.getCandidateNumbers(maxChannels, options.possibleChannels)
-    const candidates = numbers.flatMap((number) => this.buildCandidates(number, options.vendor))
+    const candidates = numbers.flatMap((number) =>
+      this.buildCandidates(
+        number,
+        options.vendor,
+        options.possibleChannels?.find((channel) => channel.number === number)
+      )
+    )
     const found = new Map<number, RecorderChannel>()
     let completed = 0
 
@@ -99,8 +105,15 @@ export class RecorderProbeService {
     return Array.from({ length: maxChannels }, (_, index) => index + 1)
   }
 
-  private buildCandidates(number: number, vendor: RecorderVendor): ProbeCandidate[] {
-    const paths = this.pathsFor(number, vendor)
+  private buildCandidates(
+    number: number,
+    vendor: RecorderVendor,
+    knownChannel?: RecorderChannel
+  ): ProbeCandidate[] {
+    const knownPaths = knownChannel?.streamIds
+    const paths = knownPaths && (knownPaths.main || knownPaths.sub)
+      ? [{ main: knownPaths.main || '', sub: knownPaths.sub || '' }]
+      : this.pathsFor(number, vendor)
     return paths
       .flatMap((path) => [
         { number, path: path.main, stream: 'main' as const },

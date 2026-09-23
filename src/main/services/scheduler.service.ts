@@ -8,6 +8,7 @@ import { r2Service } from './r2.service'
 import { vaultService } from './vault.service'
 import { localCourtService } from './local-court.service'
 import { videoSourceResolver } from './video-source-resolver.service'
+import { mediaMtxService } from './media-mtx.service'
 
 export interface Match {
   id: string
@@ -296,13 +297,25 @@ class SchedulerService {
     }
 
     let rtspUrl: string
+    let releaseVideoSource: (() => Promise<void>) | undefined
     try {
-      const resolvedSource = await videoSourceResolver.resolveVideoSource(
-        court.id,
-        profileId,
-        'recording'
-      )
-      rtspUrl = resolvedSource.recordingUrl
+      if (court.video_source.type === 'recorder') {
+        const mediaSource = await mediaMtxService.startPreview(court.video_source, profileId, 'main')
+        rtspUrl = mediaSource.localRtspUrl
+        let released = false
+        releaseVideoSource = async () => {
+          if (released) return
+          released = true
+          await mediaMtxService.stopPreview(mediaSource)
+        }
+      } else {
+        const resolvedSource = await videoSourceResolver.resolveVideoSource(
+          court.id,
+          profileId,
+          'recording'
+        )
+        rtspUrl = resolvedSource.recordingUrl
+      }
     } catch (error) {
       console.error(`Video source resolution failed for match ${match.id}:`, (error as Error).message)
       await db
@@ -350,6 +363,7 @@ class SchedulerService {
         },
         onComplete: async (savedPath) => {
           console.log(`Recording complete for match ${match.id}. Local file: ${savedPath}`)
+          await releaseVideoSource?.()
           this.showNotification(
             'Grabación Finalizada',
             `La grabación para ${match.player_name} finalizó. Procesando subida...`
@@ -358,6 +372,7 @@ class SchedulerService {
         },
         onError: async (err) => {
           console.error(`Recording error for match ${match.id}:`, err)
+          await releaseVideoSource?.()
           this.showNotification(
             'Error de Grabación',
             `Ocurrió un error al grabar el partido de ${match.player_name}.`
@@ -370,6 +385,7 @@ class SchedulerService {
         }
       })
     } catch (err) {
+      await releaseVideoSource?.()
       console.error(`Failed to initialize recording for match ${match.id}:`, err)
       await db
         .from('matches')

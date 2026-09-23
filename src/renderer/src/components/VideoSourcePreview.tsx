@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { VideoSource } from '../../../shared/video-source'
+import RecorderWebRtcPreview from './RecorderWebRtcPreview'
 
 interface VideoSourcePreviewProps {
   courtId: string
@@ -14,6 +15,7 @@ interface JsmpegDestination {
 }
 
 interface JsmpegPlayer {
+  stop(): void
   destroy(): void
 }
 
@@ -36,7 +38,7 @@ interface PreviewSource {
   destroy(): void
 }
 
-export default function VideoSourcePreview({
+function DirectVideoSourcePreview({
   courtId,
   profileId,
   source,
@@ -95,6 +97,7 @@ export default function VideoSourcePreview({
       canvas: canvasRef.current,
       autoplay: true,
       audio: false,
+      disableGl: true,
       videoBufferSize: 512 * 1024
     })
     playerRef.current = player
@@ -123,7 +126,10 @@ export default function VideoSourcePreview({
       mounted = false
       window.electron.ipcRenderer.removeAllListeners(channel)
       void window.electron.ipcRenderer.invoke('stream:stop', courtId)
-      if (playerRef.current) playerRef.current.destroy()
+      if (playerRef.current) {
+        playerRef.current.stop()
+        playerRef.current.destroy()
+      }
       playerRef.current = null
       sourceRef.current = null
     }
@@ -181,6 +187,20 @@ export default function VideoSourcePreview({
       )}
     </div>
   )
+}
+
+export default function VideoSourcePreview(props: VideoSourcePreviewProps): React.JSX.Element {
+  if (props.source?.type === 'recorder' && props.profileId) {
+    return (
+      <RecorderWebRtcPreview
+        courtId={props.courtId}
+        profileId={props.profileId}
+        source={props.source}
+        compact={props.compact}
+      />
+    )
+  }
+  return <DirectVideoSourcePreview {...props} />
 }
 
 function PreviewPlaceholder({
