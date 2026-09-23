@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CheckCircle2, Eye, Loader2, RefreshCw, Video, XCircle } from 'lucide-react'
+import { CheckCircle2, Eye, Loader2, RefreshCw, Trash2, Video, XCircle } from 'lucide-react'
 import type {
   LocalRecorder,
   RecorderChannel,
@@ -212,6 +212,23 @@ export default function RecorderSetupModal({
     await discover(recorder.id)
   }
 
+  const handleForgetRecorder = async (recorder: LocalRecorder): Promise<void> => {
+    if (!window.electron) return
+    if (!window.confirm(`¿Dejar de recordar el grabador "${recorder.name}"?`)) return
+
+    const result = await window.electron.ipcRenderer.invoke('recorders:delete', {
+      recorderId: recorder.id,
+      profileId
+    })
+    if (!result.success) {
+      setError(toFriendlyError(result.error))
+      return
+    }
+
+    setRecorders((current) => current.filter((candidate) => candidate.id !== recorder.id))
+    setError(null)
+  }
+
   const handleCancelDiscovery = async () => {
     if (requestIdRef.current && window.electron) {
       await window.electron.ipcRenderer.invoke('recorders:cancel', requestIdRef.current)
@@ -233,8 +250,12 @@ export default function RecorderSetupModal({
     })
     setTestingChannelId(null)
     if (result.success) {
+      const validatedChannel = { ...channel, mainStreamAvailable: true }
       setTestedChannelId(channel.id)
-      setSelectedChannel(channel)
+      setChannels((current) =>
+        current.map((candidate) => (candidate.id === channel.id ? validatedChannel : candidate))
+      )
+      setSelectedChannel(validatedChannel)
     } else {
       setError(toFriendlyError(result.error))
     }
@@ -311,9 +332,20 @@ export default function RecorderSetupModal({
                           {recorder.host} · {recorder.vendor === 'unknown' ? 'Fabricante no detectado' : recorder.vendor}
                         </div>
                       </div>
-                      <button className="btn btn-secondary btn-sm" type="button" onClick={() => handleUseExisting(recorder)}>
-                        Usar este grabador
-                      </button>
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                        <button className="btn btn-secondary btn-sm" type="button" onClick={() => handleUseExisting(recorder)}>
+                          Usar este grabador
+                        </button>
+                        <button
+                          className="btn btn-secondary btn-sm"
+                          type="button"
+                          onClick={() => void handleForgetRecorder(recorder)}
+                          title="Dejar de recordar este grabador"
+                          aria-label={`Dejar de recordar ${recorder.name}`}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -464,7 +496,7 @@ export default function RecorderSetupModal({
                         {isSelected && <CheckCircle2 size={18} style={{ color: 'var(--color-primary)' }} />}
                       </div>
                       <div style={{ display: 'flex', gap: '6px', marginTop: '10px' }}>
-                        <button className="btn btn-secondary btn-sm" type="button" disabled={isTesting || channel.mainStreamAvailable === false} onClick={() => handleTestChannel(channel)}>
+                        <button className="btn btn-secondary btn-sm" type="button" disabled={isTesting} onClick={() => handleTestChannel(channel)}>
                           {isTesting ? <Loader2 size={13} className="anim-spin" /> : <Eye size={13} />} Probar
                         </button>
                         <button className="btn btn-primary btn-sm" type="button" disabled={channel.mainStreamAvailable === false} onClick={() => setSelectedChannel(channel)}>

@@ -213,11 +213,13 @@ export class RecorderService {
       this.adapterVendor(recorder, channel)
     )
     const uri = await adapter.getStreamUri(channel, stream)
+    const parsedUri = new URL(uri)
+    const streamPath = `${parsedUri.pathname}${parsedUri.search}`
     const result = await recorderProbeService.probe({
       recorder,
       credentials,
       vendor: this.adapterVendor(recorder, channel),
-      possibleChannels: [{ ...channel, streamIds: { [stream]: new URL(uri).pathname } }],
+      possibleChannels: [{ ...channel, streamIds: { [stream]: streamPath } }],
       maxChannels: 1,
       timeoutMs: 5000,
       signal
