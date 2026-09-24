@@ -8,7 +8,13 @@ interface RecorderWebRtcPreviewProps {
   compact?: boolean
 }
 
-type PreviewStatus = 'connecting' | 'playing' | 'error'
+type PreviewStatus = 'connecting' | 'playing' | 'fallback' | 'error'
+
+type PreviewHandle = {
+  key: string
+  pathName: string
+  whepUrl: string
+}
 
 export default function RecorderWebRtcPreview({
   courtId,
@@ -18,19 +24,46 @@ export default function RecorderWebRtcPreview({
 }: RecorderWebRtcPreviewProps): React.JSX.Element {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const peerRef = useRef<RTCPeerConnection | null>(null)
-  const handleRef = useRef<{ key: string; pathName: string } | null>(null)
+  const handleRef = useRef<PreviewHandle | null>(null)
   const [status, setStatus] = useState<PreviewStatus>('connecting')
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     let mounted = true
-    const start = async (): Promise<void> => {
+    let compatibilityStarted = false
+    let firstFrameTimer: number | null = null
+
+    const closePeer = (): void => {
+      if (firstFrameTimer !== null) window.clearTimeout(firstFrameTimer)
+      firstFrameTimer = null
+      peerRef.current?.close()
+      peerRef.current = null
+      if (videoRef.current) videoRef.current.srcObject = null
+    }
+
+    const releaseHandle = async (): Promise<void> => {
+      if (!handleRef.current) return
+      const handle = handleRef.current
+      handleRef.current = null
+      await window.electron.ipcRenderer.invoke('video-source:preview-stop', handle)
+    }
+
+    const start = async (compatibility: boolean): Promise<void> => {
       try {
+        if (compatibility) {
+          setStatus('fallback')
+          setError('Preparando transcodificación de compatibilidad…')
+        } else {
+          setStatus('connecting')
+          setError(null)
+        }
+
         const result = await window.electron.ipcRenderer.invoke('video-source:preview-start', {
           courtId,
           profileId,
           source,
-          profile: 'sub'
+          profile: compatibility ? 'main' : source.stream || 'sub',
+          compatibility
         })
         if (!result.success || !result.data) throw new Error(result.error || 'No se pudo preparar MediaMTX.')
         handleRef.current = result.data
@@ -42,13 +75,23 @@ export default function RecorderWebRtcPreview({
           if (!mounted || !videoRef.current) return
           videoRef.current.srcObject = event.streams[0]
           void videoRef.current.play().catch(() => undefined)
-          setStatus('playing')
         }
         peer.onconnectionstatechange = () => {
           if (!mounted) return
           if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
-            setStatus('error')
-            setError('La conexión WebRTC con el DVR se interrumpió.')
+            if (!compatibility && !compatibilityStarted) {
+              compatibilityStarted = true
+              closePeer()
+              void releaseHandle().then(() => start(true))
+            } else {
+              setStatus('error')
+              setError('La conexión WebRTC con el DVR se interrumpió.')
+            }
+          }
+        }
+        if (videoRef.current) {
+          videoRef.current.onloadeddata = () => {
+            if (mounted) setStatus('playing')
           }
         }
 
@@ -62,24 +105,34 @@ export default function RecorderWebRtcPreview({
         })
         if (!response.ok) throw new Error(`MediaMTX WHEP respondió ${response.status}.`)
         await peer.setRemoteDescription({ type: 'answer', sdp: await response.text() })
+
+        firstFrameTimer = window.setTimeout(() => {
+          if (!mounted || videoRef.current?.readyState === 4) return
+          if (!compatibility && !compatibilityStarted) {
+            compatibilityStarted = true
+            closePeer()
+            void releaseHandle().then(() => start(true))
+          }
+        }, 8000)
       } catch (startError) {
-        if (mounted) {
-          setStatus('error')
-          setError((startError as Error).message || 'No se pudo iniciar el preview DVR.')
+        if (!mounted) return
+        if (!compatibility && !compatibilityStarted) {
+          compatibilityStarted = true
+          closePeer()
+          await releaseHandle()
+          await start(true)
+          return
         }
+        setStatus('error')
+        setError((startError as Error).message || 'No se pudo iniciar el preview DVR.')
       }
     }
 
-    void start()
+    void start(false)
     return () => {
       mounted = false
-      peerRef.current?.close()
-      peerRef.current = null
-      if (videoRef.current) videoRef.current.srcObject = null
-      if (handleRef.current) {
-        void window.electron.ipcRenderer.invoke('video-source:preview-stop', handleRef.current)
-        handleRef.current = null
-      }
+      closePeer()
+      void releaseHandle()
     }
   }, [courtId, profileId, source])
 
@@ -103,14 +156,9 @@ export default function RecorderWebRtcPreview({
         playsInline
         style={{ width: '100%', height: '100%', display: 'block', objectFit: 'cover' }}
       />
-      {status === 'connecting' && (
-        <span className="text-secondary text-xs" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center' }}>
-          Conectando preview DVR…
-        </span>
-      )}
-      {status === 'error' && (
+      {status !== 'playing' && (
         <span className="text-secondary text-xs" style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', padding: '12px', textAlign: 'center' }}>
-          {error || 'No se pudo visualizar el canal DVR.'}
+          {status === 'fallback' ? 'Preparando compatibilidad de video…' : error || 'Conectando preview DVR…'}
         </span>
       )}
     </div>

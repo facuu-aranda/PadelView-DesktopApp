@@ -14,6 +14,7 @@ export interface RecordingOptions {
   rtspUrl: string
   durationSeconds: number
   outputFilePath: string
+  includeAudio?: boolean
   onProgress?: (progress: RecordingProgress) => void
   onComplete?: (outputFilePath: string) => void
   onError?: (error: Error) => void
@@ -58,8 +59,16 @@ class FFmpegService {
    * Starts a recording session for an RTSP camera stream.
    */
   public startRecording(options: RecordingOptions): void {
-    const { matchId, rtspUrl, durationSeconds, outputFilePath, onProgress, onComplete, onError } =
-      options
+    const {
+      matchId,
+      rtspUrl,
+      durationSeconds,
+      outputFilePath,
+      includeAudio = true,
+      onProgress,
+      onComplete,
+      onError
+    } = options
 
     if (this.activeProcesses.has(matchId)) {
       onError?.(new Error(`Recording already active for match: ${matchId}`))
@@ -85,12 +94,19 @@ class FFmpegService {
       rtspUrl, // Input URL
       '-t',
       durationSeconds.toString(), // Duration limit
-      '-c',
-      'copy', // Stream copy both video and audio (avoids crashing if stream has no audio)
-      '-movflags',
-      '+faststart', // Move index to start of file for fast web playback
-      outputFilePath
+      '-map',
+      '0:v:0',
+      '-c:v',
+      'copy'
     ]
+
+    if (includeAudio) {
+      args.push('-map', '0:a?', '-c:a', 'copy')
+    } else {
+      args.push('-an')
+    }
+
+    args.push('-movflags', '+faststart', outputFilePath)
 
     try {
       const child = spawn(ffmpegPath, args)

@@ -853,10 +853,15 @@ function registerIpcHandlers(): void {
     'video-source:preview-start',
     async (
       _,
-      input: { source: RecorderSource; profileId: string; profile?: 'main' | 'sub' }
+      input: { source: RecorderSource; profileId: string; profile?: 'main' | 'sub'; compatibility?: boolean }
     ) => {
       try {
-        const handle = await mediaMtxService.startPreview(input.source, input.profileId, input.profile || 'sub')
+        const handle = await mediaMtxService.startPreview(
+          input.source,
+          input.profileId,
+          input.profile || 'sub',
+          input.compatibility === true
+        )
         return { success: true, data: handle }
       } catch (error) {
         console.error('video-source:preview-start error:', (error as Error).message)

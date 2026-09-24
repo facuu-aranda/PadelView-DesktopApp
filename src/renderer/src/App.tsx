@@ -1304,6 +1304,9 @@ function App(): React.JSX.Element {
                           courtPreviewEnabled[court.id] !== undefined
                             ? courtPreviewEnabled[court.id]
                             : defaultPreviewEnabled
+                        const keepRecorderPreviewMounted =
+                          court.video_source.type === 'recorder' &&
+                          courtPreviewEnabled[court.id] !== undefined
 
                         return (
                           <div
@@ -1389,8 +1392,13 @@ function App(): React.JSX.Element {
                               </div>
                             </div>
                             <div className="court-card-body">
-                              {isPreviewActive && (
-                                <div style={{ marginBottom: '12px' }}>
+                              {(isPreviewActive || keepRecorderPreviewMounted) && (
+                                <div
+                                  style={{
+                                    display: isPreviewActive ? 'block' : 'none',
+                                    marginBottom: '12px'
+                                  }}
+                                >
                                   <VideoSourcePreview
                                     courtId={court.id}
                                     profileId={sessionUser?.id}

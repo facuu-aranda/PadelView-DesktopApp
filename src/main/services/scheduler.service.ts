@@ -354,6 +354,7 @@ class SchedulerService {
         rtspUrl,
         durationSeconds,
         outputFilePath,
+        includeAudio: court.video_source.type === 'direct-camera',
         onProgress: (prog) => {
           this.notifyUI('recording-progress', {
             matchId: prog.matchId,
