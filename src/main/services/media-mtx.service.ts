@@ -5,6 +5,7 @@ import os from 'os'
 import path from 'path'
 import type { RecorderSource } from '../../shared/video-source'
 import { recorderService } from './recorder/recorder.service'
+import { ffmpegService } from './ffmpeg.service'
 
 export type MediaMtxPreviewProfile = 'main' | 'sub'
 
@@ -14,11 +15,13 @@ export interface MediaMtxPreviewHandle {
   whepUrl: string
   localRtspUrl: string
   profile: MediaMtxPreviewProfile
+  compatibility: boolean
 }
 
 interface ActivePath {
   handle: MediaMtxPreviewHandle
   references: number
+  publisher?: ChildProcess
   releaseTimer?: NodeJS.Timeout
 }
 
@@ -35,9 +38,10 @@ export class MediaMtxService {
   public async startPreview(
     source: RecorderSource,
     profileId: string,
-    profile: MediaMtxPreviewProfile = 'sub'
+    profile: MediaMtxPreviewProfile = 'sub',
+    compatibility = false
   ): Promise<MediaMtxPreviewHandle> {
-    const key = this.getStreamKey(source, profile)
+    const key = this.getStreamKey(source, profile, compatibility)
     const current = this.activePaths.get(key)
     if (current) {
       if (current.releaseTimer) clearTimeout(current.releaseTimer)
@@ -54,18 +58,26 @@ export class MediaMtxService {
       'preview'
     )
     const inputUrl = profile === 'main' ? resolvedSource.recordingUrl : resolvedSource.previewUrl || resolvedSource.recordingUrl
-    const pathName = this.pathNameFor(source, profile)
+    const pathName = this.pathNameFor(source, profile, compatibility)
 
-    await this.ensurePath(pathName, inputUrl)
+    const publisher = await this.ensurePath(pathName, inputUrl, compatibility)
+    try {
+      if (compatibility) await this.waitForActivePath(pathName, 10000)
+    } catch (error) {
+      publisher?.kill()
+      await this.removePath(pathName)
+      throw error
+    }
     console.log(`[MediaMTX] path ready: ${pathName}`)
     const handle: MediaMtxPreviewHandle = {
       key,
       pathName,
       profile,
+      compatibility,
       localRtspUrl: `rtsp://127.0.0.1:${RTSP_PORT}/${pathName}`,
       whepUrl: `http://127.0.0.1:${WEBRTC_PORT}/${pathName}/whep`
     }
-    this.activePaths.set(key, { handle, references: 1 })
+    this.activePaths.set(key, { handle, references: 1, publisher })
     return handle
   }
 
@@ -76,6 +88,7 @@ export class MediaMtxService {
     if (active.references > 0) return
 
     active.releaseTimer = setTimeout(() => {
+      active.publisher?.kill()
       void this.removePath(active.handle.pathName)
       this.activePaths.delete(handle.key)
     }, 10000)
@@ -84,6 +97,7 @@ export class MediaMtxService {
   public async stop(): Promise<void> {
     for (const active of this.activePaths.values()) {
       if (active.releaseTimer) clearTimeout(active.releaseTimer)
+      active.publisher?.kill()
     }
     this.activePaths.clear()
     if (this.process) {
@@ -151,15 +165,95 @@ export class MediaMtxService {
     throw new Error('MediaMTX no respondió en el puerto API local.')
   }
 
-  private async ensurePath(pathName: string, source: string): Promise<void> {
+  private async ensurePath(pathName: string, source: string, compatibility: boolean): Promise<ChildProcess | undefined> {
     const response = await fetch(`http://127.0.0.1:${API_PORT}/v3/config/paths/add/${encodeURIComponent(pathName)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ source, sourceOnDemand: true, rtspTransport: 'tcp' })
+      body: JSON.stringify({
+        source: compatibility ? 'publisher' : source,
+        sourceOnDemand: !compatibility,
+        rtspTransport: 'tcp'
+      })
     })
     if (!response.ok && response.status !== 400) {
       throw new Error(`MediaMTX no pudo crear el path local (${response.status}).`)
     }
+    if (!compatibility) return undefined
+
+    const localUrl = `rtsp://127.0.0.1:${RTSP_PORT}/${pathName}`
+    const process = spawn(ffmpegService.getFFmpegPath(), [
+      '-hide_banner',
+      '-nostdin',
+      '-loglevel',
+      'error',
+      '-rtsp_transport',
+      'tcp',
+      '-analyzeduration',
+      '1000000',
+      '-probesize',
+      '1000000',
+      '-i',
+      source,
+      '-map',
+      '0:v:0',
+      '-an',
+      '-vf',
+      'scale=640:-2',
+      '-r',
+      '15',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-tune',
+      'zerolatency',
+      '-profile:v',
+      'baseline',
+      '-pix_fmt',
+      'yuv420p',
+      '-g',
+      '30',
+      '-keyint_min',
+      '30',
+      '-bf',
+      '0',
+      '-f',
+      'rtsp',
+      '-rtsp_transport',
+      'tcp',
+      localUrl
+    ], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
+    let stderr = ''
+    process.stderr?.on('data', (data: Buffer) => {
+      stderr = `${stderr}${data.toString()}`.slice(-8000)
+    })
+    process.once('error', (error) => console.error('[MediaMTX] compatibility transcoder error:', error.message))
+    process.once('close', (code, signal) => {
+      const diagnostic = sanitizeMediaMtxLog(stderr)
+      console.log(`[MediaMTX] compatibility transcoder closed with exit code ${code} signal ${signal || 'none'}`)
+      if (diagnostic) console.error(`[MediaMTX] compatibility transcoder stderr: ${diagnostic}`)
+    })
+    return process
+  }
+
+  private async waitForActivePath(pathName: string, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${API_PORT}/v3/paths/list`)
+        if (response.ok) {
+          const payload = (await response.json()) as {
+            items?: Array<{ name?: string; ready?: boolean; state?: string; source?: { ready?: boolean } }>
+          }
+          const path = payload.items?.find((item) => item.name === pathName)
+          if (path && (path.ready === true || path.state === 'ready' || path.source?.ready === true)) return
+        }
+      } catch {
+        // Continue polling until the deadline.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    throw new Error('MediaMTX no activó el publisher de compatibilidad a tiempo.')
   }
 
   private async removePath(pathName: string): Promise<void> {
@@ -218,6 +312,8 @@ export class MediaMtxService {
       '    permissions:',
       '      - action: read',
       '        path:',
+      '      - action: publish',
+      '        path:',
       '      - action: api',
       'hls: false',
       'webrtc: true',
@@ -230,12 +326,20 @@ export class MediaMtxService {
     ].join(os.EOL)
   }
 
-  private getStreamKey(source: RecorderSource, profile: MediaMtxPreviewProfile): string {
-    return `${source.recorderId}:${source.channelId}:${source.channelNumber || 0}:${profile}`
+  private getStreamKey(
+    source: RecorderSource,
+    profile: MediaMtxPreviewProfile,
+    compatibility: boolean
+  ): string {
+    return `${source.recorderId}:${source.channelId}:${source.channelNumber || 0}:${profile}:${compatibility ? 'compat' : 'direct'}`
   }
 
-  private pathNameFor(source: RecorderSource, profile: MediaMtxPreviewProfile): string {
-    const safe = `${source.recorderId}_${source.channelNumber || source.channelId}_${profile}`.replace(/[^a-zA-Z0-9_-]/g, '_')
+  private pathNameFor(
+    source: RecorderSource,
+    profile: MediaMtxPreviewProfile,
+    compatibility: boolean
+  ): string {
+    const safe = `${source.recorderId}_${source.channelNumber || source.channelId}_${profile}_${compatibility ? 'compat' : 'direct'}`.replace(/[^a-zA-Z0-9_-]/g, '_')
     return `viewpadel_dvr_${safe}`
   }
 }
