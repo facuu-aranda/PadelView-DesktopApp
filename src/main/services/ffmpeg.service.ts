@@ -9,6 +9,13 @@ export interface RecordingProgress {
   outputFilePath: string
 }
 
+export interface RecordingCompletion {
+  elapsedSeconds: number
+  durationSeconds: number
+  partial: boolean
+  manualStop: boolean
+}
+
 export interface RecordingOptions {
   matchId: string
   rtspUrl: string
@@ -16,13 +23,14 @@ export interface RecordingOptions {
   outputFilePath: string
   includeAudio?: boolean
   onProgress?: (progress: RecordingProgress) => void
-  onComplete?: (outputFilePath: string) => void
+  onComplete?: (outputFilePath: string, completion: RecordingCompletion) => void
   onError?: (error: Error) => void
 }
 
 class FFmpegService {
   private activeProcesses: Map<string, ChildProcess> = new Map()
   private progressIntervals: Map<string, NodeJS.Timeout> = new Map()
+  private manualStopRequests: Set<string> = new Set()
 
   /**
    * Resolves the path to the ffmpeg executable.
@@ -89,6 +97,9 @@ class FFmpegService {
     const args = [
       '-rtsp_transport',
       'tcp', // Force TCP to prevent artifacting/frame loss
+      // FFmpeg's RTSP demuxer exposes -timeout in microseconds for socket I/O.
+      '-timeout',
+      '15000000', // Do not wait indefinitely for a network read (15 seconds)
       '-y', // Overwrite output files without asking
       '-i',
       rtspUrl, // Input URL
@@ -113,6 +124,7 @@ class FFmpegService {
       this.activeProcesses.set(matchId, child)
 
       let errorLog = ''
+      let handled = false
       const startTime = Date.now()
 
       // Monitor recording duration & invoke progress callback
@@ -128,61 +140,81 @@ class FFmpegService {
       this.progressIntervals.set(matchId, progressTimer)
 
       child.stderr?.on('data', (data) => {
-        const text = data.toString()
-        errorLog += text
-        // Keep logs size readable
-        if (errorLog.length > 5000) {
-          errorLog = errorLog.slice(-5000)
+        errorLog += data.toString()
+        // Keep the tail: FFmpeg generally prints the most actionable error last.
+        if (errorLog.length > 10000) {
+          errorLog = errorLog.slice(-10000)
         }
       })
 
       child.on('error', (err) => {
+        if (handled) return
+        handled = true
         console.error(`FFmpeg process failed to spawn or crashed:`, err)
         this.cleanup(matchId)
 
-        let customErr = err
-        if ((err as any).code === 'ENOENT') {
+        let customErr: Error = err
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
           customErr = new Error(
             `FFmpeg binary not found at: ${ffmpegPath}. Please configure the static binary.`
           )
         }
+        const stderr = this.redactRtspUrls(errorLog).trim()
+        if (stderr) customErr.message += `\nFFmpeg stderr:\n${stderr}`
         onError?.(customErr)
       })
 
-      child.on('close', (code) => {
-        console.log(`FFmpeg process for match ${matchId} closed with exit code ${code}`)
+      child.on('close', (code, signal) => {
+        if (handled) return
+        handled = true
+        const elapsedSeconds = Math.floor((Date.now() - startTime) / 1000)
+        const manualStopRequested = this.manualStopRequests.delete(matchId)
+        const outputExists = fs.existsSync(outputFilePath)
+        const outputSize = outputExists ? fs.statSync(outputFilePath).size : 0
+        const stderr = this.redactRtspUrls(errorLog).trim()
+        const durationToleranceSeconds = Math.max(5, durationSeconds * 0.05)
+        const reachedExpectedDuration = elapsedSeconds + durationToleranceSeconds >= durationSeconds
+
+        console.log(
+          `FFmpeg process for match ${matchId} closed with exit code ${code}, signal ${signal ?? 'none'}, ` +
+            `elapsed ${elapsedSeconds}s/${durationSeconds}s`
+        )
         this.cleanup(matchId)
 
-        if (code === 0) {
-          // Verify that output file actually exists and is non-empty
-          if (fs.existsSync(outputFilePath) && fs.statSync(outputFilePath).size > 0) {
-            onComplete?.(outputFilePath)
-          } else {
-            onError?.(
-              new Error('FFmpeg finished successfully but output file is empty or missing.')
-            )
-          }
-        } else {
-          // If code is null, it was probably killed manually
-          if (code === null) {
-            // Check if file is valid (may be partial recording saved)
-            if (fs.existsSync(outputFilePath) && fs.statSync(outputFilePath).size > 1024 * 1024) {
-              console.log('Recording was stopped manually, saving partial recording.')
-              onComplete?.(outputFilePath)
-            } else {
-              onError?.(new Error('Recording was manually stopped and file is empty or corrupted.'))
-            }
-          } else {
-            onError?.(
-              new Error(
-                `FFmpeg process exited with code ${code}. Error log:\n${this.redactRtspUrls(errorLog)}`
-              )
-            )
-          }
+        if (code === 0 && outputSize > 0 && reachedExpectedDuration) {
+          onComplete?.(outputFilePath, {
+            elapsedSeconds,
+            durationSeconds,
+            partial: false,
+            manualStop: false
+          })
+          return
         }
+
+        // A clean user-requested stop may produce a valid partial file. This is
+        // intentionally explicit; code === null alone never means completion.
+        if (manualStopRequested && outputSize > 1024 * 1024 && (code === 0 || code === null)) {
+          console.log(`Recording for match ${matchId} stopped manually; saving partial file.`)
+          onComplete?.(outputFilePath, {
+            elapsedSeconds,
+            durationSeconds,
+            partial: true,
+            manualStop: true
+          })
+          return
+        }
+
+        const status = code === null ? `signal ${signal ?? 'unknown'}` : `exit code ${code}`
+        const reason =
+          code === 0
+            ? `terminated prematurely after ${elapsedSeconds}s (expected ${durationSeconds}s)`
+            : `terminated with ${status} after ${elapsedSeconds}s`
+        const details = stderr ? `\nFFmpeg stderr:\n${stderr}` : '\nFFmpeg stderr: (empty)'
+        onError?.(new Error(`FFmpeg recording ${reason}.${details}`))
       })
     } catch (err) {
       console.error(`Error spawning FFmpeg:`, err)
+      this.cleanup(matchId)
       onError?.(err as Error)
     }
   }
@@ -194,6 +226,7 @@ class FFmpegService {
     const child = this.activeProcesses.get(matchId)
     if (child) {
       console.log(`Stopping active recording cleanly via stdin for match: ${matchId}`)
+      this.manualStopRequests.add(matchId)
       try {
         if (child.stdin && child.stdin.writable) {
           child.stdin.write('q\n')
@@ -236,6 +269,7 @@ class FFmpegService {
    */
   private cleanup(matchId: string): void {
     this.activeProcesses.delete(matchId)
+    this.manualStopRequests.delete(matchId)
 
     const interval = this.progressIntervals.get(matchId)
     if (interval) {

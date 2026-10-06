@@ -3,7 +3,7 @@ import icon from '../../../resources/icon.png?asset'
 import path from 'path'
 import fs from 'fs'
 import { dbService } from './db.service'
-import { ffmpegService } from './ffmpeg.service'
+import { ffmpegService, type RecordingCompletion } from './ffmpeg.service'
 import { r2Service } from './r2.service'
 import { vaultService } from './vault.service'
 import { localCourtService } from './local-court.service'
@@ -95,6 +95,40 @@ class SchedulerService {
     })
   }
 
+  private matchContext(match: Match): string {
+    const court = match.court_name || match.court_id || 'unknown court'
+    const player = match.player_name || 'unknown match'
+    return `match ${match.id} (${player}, court ${court})`
+  }
+
+  private getMatchWindow(
+    match: Match
+  ): { startTime: Date; endTime: Date; durationMs: number } | null {
+    const startTime = new Date(match.start_time)
+    const endTime = new Date(match.end_time)
+    const durationMs = endTime.getTime() - startTime.getTime()
+
+    if (!Number.isFinite(startTime.getTime()) || !Number.isFinite(endTime.getTime())) {
+      return null
+    }
+    if (durationMs <= 0) return null
+
+    return { startTime, endTime, durationMs }
+  }
+
+  private async markMatchFailed(match: Match, reason: string): Promise<void> {
+    const message = `${this.matchContext(match)}: ${reason}`
+    console.error(message)
+    const { error } = await dbService
+      .getClient()
+      .from('matches')
+      .update({ status: 'FAILED', error_log: message })
+      .eq('id', match.id)
+
+    if (error) console.error(`Could not mark ${this.matchContext(match)} as FAILED:`, error)
+    this.notifyUI('match-updated', match.id)
+  }
+
   /**
    * Main scheduler tick logic.
    */
@@ -135,28 +169,24 @@ class SchedulerService {
       }
 
       for (const match of matches as Match[]) {
-        const startTime = new Date(match.start_time)
-        const endTime = new Date(match.end_time)
+        const window = this.getMatchWindow(match)
+        if (!window) {
+          await this.markMatchFailed(
+            match,
+            `invalid recording window: start_time and end_time must be valid and end_time must be after start_time (received start=${match.start_time}, end=${match.end_time})`
+          )
+          continue
+        }
 
-        // Check if current time is within recording window
-        // We start if we are within 1 minute of start_time or if the match has already started (and not ended)
+        const { startTime, endTime } = window
+        // Check if current time is within recording window. The duration passed to
+        // FFmpeg is derived from this same validated window; it is never guessed.
         const isTimeForRecording = now >= new Date(startTime.getTime() - 60000) && now < endTime
 
         if (isTimeForRecording && !ffmpegService.isRecording(match.id)) {
           await this.processRecordingStart(match, now, endTime)
         } else if (now >= endTime && !ffmpegService.isRecording(match.id)) {
-          // If the match end time is passed and it was never recorded
-          console.warn(
-            `Match ${match.id} end time passed but was never recorded. Marking as FAILED.`
-          )
-          await db
-            .from('matches')
-            .update({
-              status: 'FAILED',
-              error_log: 'Match time window expired without recording starting.'
-            })
-            .eq('id', match.id)
-          this.notifyUI('match-updated', match.id)
+          await this.markMatchFailed(match, 'recording window expired without recording starting')
         }
       }
 
@@ -165,14 +195,13 @@ class SchedulerService {
         this.lastCleanupTime = now.getTime()
         const retentionDaysStr = vaultService.getSecret('VIDEO_RETENTION_DAYS') || '30'
         const retentionDays = parseInt(retentionDaysStr, 10)
-        
+
         if (retentionDays > 0) {
-          r2Service.deleteOldVideos(retentionDays).catch(err => {
+          r2Service.deleteOldVideos(retentionDays).catch((err) => {
             console.error('Error during auto-cleanup of old videos:', err)
           })
         }
       }
-      
     } catch (err) {
       console.error('Error during scheduler tick:', err)
     } finally {
@@ -283,16 +312,36 @@ class SchedulerService {
   ): Promise<void> {
     const db = dbService.getClient()
     const profileId = match.profile_id || dbService.getProfileId()
+    const matchWindow = this.getMatchWindow(match)
+    const nowMs = now.getTime()
+    const endTimeMs = endTime.getTime()
+
+    if (
+      !matchWindow ||
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(endTimeMs) ||
+      endTimeMs <= nowMs
+    ) {
+      await this.markMatchFailed(
+        match,
+        `invalid recording timing: start=${match.start_time}, end=${match.end_time}, now=${now.toISOString()}`
+      )
+      return
+    }
+
+    const durationSeconds = Math.floor((endTimeMs - nowMs) / 1000)
+    if (!Number.isFinite(durationSeconds) || durationSeconds < 1) {
+      await this.markMatchFailed(
+        match,
+        `invalid remaining recording duration: ${durationSeconds}s (start=${match.start_time}, end=${match.end_time})`
+      )
+      return
+    }
 
     // Resolve the local video source. The scheduler does not know recorder vendors or RTSP paths.
     const court = profileId ? localCourtService.getById(match.court_id, profileId) : null
     if (!court || !profileId) {
-      console.error(`Local court configuration not found for match ${match.id}.`)
-      await db
-        .from('matches')
-        .update({ status: 'FAILED', error_log: 'Local court configuration is missing.' })
-        .eq('id', match.id)
-      this.notifyUI('match-updated', match.id)
+      await this.markMatchFailed(match, 'local court configuration is missing')
       return
     }
 
@@ -300,7 +349,11 @@ class SchedulerService {
     let releaseVideoSource: (() => Promise<void>) | undefined
     try {
       if (court.video_source.type === 'recorder') {
-        const mediaSource = await mediaMtxService.startPreview(court.video_source, profileId, 'main')
+        const mediaSource = await mediaMtxService.startPreview(
+          court.video_source,
+          profileId,
+          'main'
+        )
         rtspUrl = mediaSource.localRtspUrl
         let released = false
         releaseVideoSource = async () => {
@@ -317,20 +370,15 @@ class SchedulerService {
         rtspUrl = resolvedSource.recordingUrl
       }
     } catch (error) {
-      console.error(`Video source resolution failed for match ${match.id}:`, (error as Error).message)
-      await db
-        .from('matches')
-        .update({ status: 'FAILED', error_log: 'Video source is unavailable locally.' })
-        .eq('id', match.id)
-      this.notifyUI('match-updated', match.id)
+      const detail = error instanceof Error ? error.message : String(error)
+      await this.markMatchFailed(match, `video source resolution failed: ${detail}`)
       return
     }
 
-    // Calculate remaining duration in seconds
-    const durationSeconds = Math.max(Math.floor((endTime.getTime() - now.getTime()) / 1000), 10)
     const outputFilePath = path.join(this.tempDir, `${match.id}.mp4`)
+    const recordingStartedAt = Date.now()
 
-    console.log(`Starting recording for match ${match.id}. Duration: ${durationSeconds}s`)
+    console.log(`Starting ${this.matchContext(match)}. Duration: ${durationSeconds}s`)
 
     try {
       // 2. Set status to RECORDING in Supabase unless an on-demand start already did it.
@@ -362,37 +410,47 @@ class SchedulerService {
             durationSeconds
           })
         },
-        onComplete: async (savedPath) => {
-          console.log(`Recording complete for match ${match.id}. Local file: ${savedPath}`)
+        onComplete: async (savedPath, completion: RecordingCompletion) => {
+          // A manually requested stop is an intentional partial recording and
+          // must continue through the upload flow. An early completion without
+          // that explicit marker is still treated as a failed recording.
+          const elapsedSeconds = Math.floor((Date.now() - recordingStartedAt) / 1000)
+          if (elapsedSeconds < durationSeconds && !completion.manualStop) {
+            await releaseVideoSource?.()
+            await this.markMatchFailed(
+              match,
+              `recording ended early after ${elapsedSeconds}s; expected ${durationSeconds}s. The local file cannot be treated as complete.`
+            )
+            return
+          }
+
+          console.log(
+            `Recording ${completion.manualStop ? 'manually stopped' : 'complete'} for ${this.matchContext(match)}. Local file: ${savedPath}`
+          )
           await releaseVideoSource?.()
           this.showNotification(
-            'Grabación Finalizada',
-            `La grabación para ${match.player_name} finalizó. Procesando subida...`
+            completion.manualStop ? 'Grabación Parcial Lista' : 'Grabación Finalizada',
+            completion.manualStop
+              ? `La grabación parcial de ${match.player_name} se está subiendo.`
+              : `La grabación para ${match.player_name} finalizó. Procesando subida...`
           )
           await this.processUploadStart(match, savedPath)
         },
         onError: async (err) => {
-          console.error(`Recording error for match ${match.id}:`, err)
+          const detail = err instanceof Error ? err.message : String(err)
+          console.error(`Recording error for ${this.matchContext(match)}:`, detail)
           await releaseVideoSource?.()
           this.showNotification(
             'Error de Grabación',
             `Ocurrió un error al grabar el partido de ${match.player_name}.`
           )
-          await db
-            .from('matches')
-            .update({ status: 'FAILED', error_log: err.message })
-            .eq('id', match.id)
-          this.notifyUI('match-updated', match.id)
+          await this.markMatchFailed(match, `recording failed: ${detail}`)
         }
       })
     } catch (err) {
       await releaseVideoSource?.()
-      console.error(`Failed to initialize recording for match ${match.id}:`, err)
-      await db
-        .from('matches')
-        .update({ status: 'FAILED', error_log: (err as Error).message })
-        .eq('id', match.id)
-      this.notifyUI('match-updated', match.id)
+      const detail = err instanceof Error ? err.message : String(err)
+      await this.markMatchFailed(match, `failed to initialize recording: ${detail}`)
     }
   }
 
@@ -403,6 +461,16 @@ class SchedulerService {
     const db = dbService.getClient()
 
     try {
+      const window = this.getMatchWindow(match)
+      if (!window) {
+        throw new Error(
+          `invalid recording window (start=${match.start_time}, end=${match.end_time})`
+        )
+      }
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).size <= 0) {
+        throw new Error('local video file is missing or empty')
+      }
+
       // 1. Update status to UPLOADING in Supabase
       await db.from('matches').update({ status: 'UPLOADING' }).eq('id', match.id)
       this.notifyUI('match-updated', match.id)
@@ -445,7 +513,9 @@ class SchedulerService {
         else console.log(`Deleted local temp file: ${filePath}`)
       })
     } catch (err) {
-      console.error(`Failed uploading match video ${match.id}:`, err)
+      const detail = err instanceof Error ? err.message : String(err)
+      const message = `${this.matchContext(match)}: upload failed: ${detail}`
+      console.error(message)
       this.showNotification(
         'Error de Subida',
         `No se pudo subir el video de ${match.player_name} a la nube.`
@@ -454,7 +524,7 @@ class SchedulerService {
         .from('matches')
         .update({
           status: 'FAILED',
-          error_log: `Upload failed: ${(err as Error).message}`
+          error_log: message
         })
         .eq('id', match.id)
       this.notifyUI('match-updated', match.id)
@@ -492,59 +562,49 @@ class SchedulerService {
 
     for (const match of matches as Match[]) {
       const filePath = path.join(this.tempDir, `${match.id}.mp4`)
+      const hasLocalFile = fs.existsSync(filePath)
+      let fileSize = 0
+
+      if (hasLocalFile) {
+        try {
+          fileSize = fs.statSync(filePath).size
+        } catch (error) {
+          console.error(`Could not inspect local file for ${this.matchContext(match)}:`, error)
+        }
+      }
 
       if (match.status === 'RECORDING') {
-        // If it was recording, checking if the file is valid to save it as partial
-        if (fs.existsSync(filePath)) {
-          const stats = fs.statSync(filePath)
-          if (stats.size > 1024 * 1024) {
-            // > 1MB partial video
-            console.log(
-              `Recovered partial recording file for match ${match.id}. Queuing for upload.`
-            )
-            // Queue for upload
-            this.processUploadStart(match, filePath).catch((err) => {
-              console.error(`Error recovering upload for match ${match.id}:`, err)
-            })
-          } else {
-            console.log(
-              `Found empty or corrupt recording file for match ${match.id}. Marking as FAILED.`
-            )
-            await db
-              .from('matches')
-              .update({
-                status: 'FAILED',
-                error_log: 'Recording interrupted (power outage or crash) and file is empty.'
-              })
-              .eq('id', match.id)
-            // Cleanup empty file
-            fs.unlink(filePath, () => {})
-          }
-        } else {
-          console.log(
-            `No recording file found for interrupted match ${match.id}. Marking as FAILED.`
+        if (!hasLocalFile) {
+          await this.markMatchFailed(
+            match,
+            'recording was interrupted and the local file was not found'
           )
-          await db
-            .from('matches')
-            .update({ status: 'FAILED', error_log: 'Recording interrupted and file not found.' })
-            .eq('id', match.id)
+        } else if (fileSize <= 0) {
+          await this.markMatchFailed(match, 'recording was interrupted and the local file is empty')
+          fs.unlink(filePath, () => {})
+        } else {
+          // A sizeable file only proves that bytes were written. Without a media
+          // duration probe, uploading it would present an unverified partial as DONE.
+          await this.markMatchFailed(
+            match,
+            `recording was interrupted; local file (${fileSize} bytes) exists but its duration cannot be validated`
+          )
         }
       } else if (match.status === 'UPLOADING') {
-        // If it was uploading, check if local file is still there and retry
-        if (fs.existsSync(filePath)) {
-          console.log(`Resuming interrupted upload for match ${match.id}...`)
-          this.processUploadStart(match, filePath).catch((err) => {
-            console.error(`Error resuming upload for match ${match.id}:`, err)
-          })
+        // UPLOADING may contain a valid file, but this file cannot be proven to
+        // cover the scheduled window with the APIs available here. Do not retry
+        // the upload because a successful retry would turn an unverified partial
+        // into DONE; leave the file for manual inspection/recovery.
+        if (!hasLocalFile) {
+          await this.markMatchFailed(
+            match,
+            'upload was interrupted and the local video file was deleted'
+          )
         } else {
-          console.log(`Local file for upload ${match.id} was lost. Marking as FAILED.`)
-          await db
-            .from('matches')
-            .update({
-              status: 'FAILED',
-              error_log: 'Upload interrupted and local video file was deleted.'
-            })
-            .eq('id', match.id)
+          await this.markMatchFailed(
+            match,
+            `upload was interrupted; local file (${fileSize} bytes) exists but its duration cannot be validated`
+          )
         }
       }
     }

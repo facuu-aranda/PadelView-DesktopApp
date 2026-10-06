@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   Activity,
   Calendar,
@@ -30,7 +30,24 @@ import RecorderSetupModal from './components/RecorderSetupModal'
 import VideoSourcePreview from './components/VideoSourcePreview'
 import LoginScreen from './components/LoginScreen'
 import { supabase } from './lib/supabase'
+import updateChangelog from './update-changelog.json'
 import type { VideoSource } from '../../shared/video-source'
+
+interface UpdaterEvent {
+  status:
+    'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error' | 'blocked'
+  version?: string
+  currentVersion?: string
+  percent?: number
+  message?: string
+  activeRecordings?: number
+  activeUploads?: number
+}
+
+interface ChangelogEntry {
+  title: string
+  items: string[]
+}
 
 interface Court {
   id: string
@@ -75,6 +92,11 @@ interface CustomTheme {
   sidebar: string
 }
 
+const getChangelogEntry = (version?: string): ChangelogEntry => {
+  const changelog = updateChangelog as Record<string, ChangelogEntry>
+  return changelog[version || ''] || changelog.default
+}
+
 const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [
   {
     bg: '#0f172a',
@@ -108,6 +130,10 @@ function App(): React.JSX.Element {
     exists: false
   })
   const [configError, setConfigError] = useState<string | null>(null)
+  const [appVersion, setAppVersion] = useState<string>('')
+  const [updaterEvent, setUpdaterEvent] = useState<UpdaterEvent | null>(null)
+  const [updateModalOpen, setUpdateModalOpen] = useState(false)
+  const [updateActionBusy, setUpdateActionBusy] = useState(false)
 
   // Sidebar collapsed state
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
@@ -122,6 +148,9 @@ function App(): React.JSX.Element {
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false)
   const [isConfigured, setIsConfigured] = useState<boolean | null>(null)
   const [sessionUser, setSessionUser] = useState<any>(null)
+  const sessionUserRef = useRef<any>(null)
+  const refreshInFlightRef = useRef<Promise<void> | null>(null)
+  const refreshQueuedRef = useRef(false)
 
   // Zoom / scale general state
   const [appScale, setAppScale] = useState<string>('100%')
@@ -217,6 +246,65 @@ function App(): React.JSX.Element {
     setTimeout(() => setToast(null), 4000)
   }
 
+  const copyTextToClipboard = async (value: string, successMessage: string): Promise<boolean> => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value)
+      } else {
+        throw new Error('Clipboard API unavailable')
+      }
+      showToast(successMessage, 'success')
+      return true
+    } catch (error) {
+      try {
+        const textarea = document.createElement('textarea')
+        textarea.value = value
+        textarea.setAttribute('readonly', '')
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        textarea.select()
+        const copied = document.execCommand('copy')
+        textarea.remove()
+        if (!copied) throw new Error('Fallback clipboard copy failed')
+        showToast(successMessage, 'success')
+        return true
+      } catch (fallbackError) {
+        console.error('Clipboard copy failed:', fallbackError || error)
+        showToast('No se pudo copiar el enlace. Intentá nuevamente.', 'error')
+        return false
+      }
+    }
+  }
+
+  const handleUpdateAction = async () => {
+    if (!window.electron || !updaterEvent) return
+    setUpdateActionBusy(true)
+    try {
+      if (updaterEvent.status === 'downloaded') {
+        const result = await window.electron.ipcRenderer.invoke('updater:install')
+        if (!result.success && result.activeRecordings + result.activeUploads > 0) {
+          setUpdaterEvent({
+            ...updaterEvent,
+            status: 'blocked',
+            message: 'La actualización quedará pendiente hasta finalizar las operaciones activas.'
+          })
+        }
+      } else if (updaterEvent.status === 'available') {
+        await window.electron.ipcRenderer.invoke('updater:download')
+      }
+    } finally {
+      setUpdateActionBusy(false)
+    }
+  }
+
+  const handleUpdateLater = () => setUpdateModalOpen(false)
+
+  const handleSkipUpdate = () => {
+    if (updaterEvent?.version) localStorage.setItem('updateSkippedVersion', updaterEvent.version)
+    setUpdateModalOpen(false)
+  }
+
   // Toggle Sidebar
   const handleToggleSidebar = () => {
     const nextState = !sidebarCollapsed
@@ -253,7 +341,8 @@ function App(): React.JSX.Element {
     console.info(`[User Action Success] Usuario inició sesión exitosamente: ${session.user.email}`)
     setIsLoggedIn(true)
     setSessionUser(session.user)
-    
+    sessionUserRef.current = session.user
+
     // Set token in Main Process so dbService uses the Anon Key with RLS
     if (window.electron) {
       await window.electron.ipcRenderer.invoke(
@@ -262,11 +351,13 @@ function App(): React.JSX.Element {
         session.user.id
       )
     }
-    
+
     // Check user profile for configuration status
     let { data: profile, error } = await supabase
       .from('profiles')
-      .select('is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url')
+      .select(
+        'is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url'
+      )
       .eq('id', session.user.id)
       .maybeSingle()
 
@@ -280,14 +371,16 @@ function App(): React.JSX.Element {
           full_name: session.user.user_metadata?.full_name || session.user.email,
           role: 'client'
         })
-        .select('is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url')
+        .select(
+          'is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url'
+        )
         .single()
-      
+
       if (!insertErr && newProfile) {
         profile = newProfile
       }
     }
-      
+
     if (profile) {
       setIsConfigured(profile.is_configured)
       const name = profile.full_name || session.user.email
@@ -295,14 +388,15 @@ function App(): React.JSX.Element {
       if (profile.club_name) setClubName(profile.club_name)
       if (profile.club_role) setClubRole(profile.club_role)
       if (profile.subscription_type) setSubType(profile.subscription_type.toLowerCase() as any)
-      if (profile.subscription_expiry) setSubExpiry(new Date(profile.subscription_expiry).toLocaleDateString())
+      if (profile.subscription_expiry)
+        setSubExpiry(new Date(profile.subscription_expiry).toLocaleDateString())
       if (profile.avatar_url) setProfileAvatar(profile.avatar_url)
-      
+
       // Update window title dynamically
       if (window.electron) {
         window.electron.ipcRenderer.send('window:set-title', `ViewPadel - ${name}`)
       }
-      
+
       // If configured, fetch cloud config and migrate legacy courts into local storage once.
       if (profile.is_configured) {
         const { data: clientConfig } = await supabase
@@ -327,7 +421,10 @@ function App(): React.JSX.Element {
           )
           if (!migrationRes.success) {
             console.error('Local court migration failed:', migrationRes.error)
-            showToast(`No se pudieron migrar las canchas existentes: ${migrationRes.error}`, 'error')
+            showToast(
+              `No se pudieron migrar las canchas existentes: ${migrationRes.error}`,
+              'error'
+            )
           }
 
           await fetchData(session.user.id)
@@ -354,6 +451,7 @@ function App(): React.JSX.Element {
     setIsLoggedIn(false)
     setIsConfigured(null)
     setSessionUser(null)
+    sessionUserRef.current = null
     showToast('Sesión cerrada.', 'info')
   }
 
@@ -368,7 +466,9 @@ function App(): React.JSX.Element {
       if (res.success) {
         setPlayingVideoUrl(res.url)
       } else {
-        console.error(`[Action Failed] Error al obtener URL firmada para video: ${key}. Detalles: ${res.error || 'Desconocido'}`)
+        console.error(
+          `[Action Failed] Error al obtener URL firmada para video: ${key}. Detalles: ${res.error || 'Desconocido'}`
+        )
         showToast('Error al obtener URL del video', 'error')
         setPlayingVideoId(null)
       }
@@ -389,14 +489,20 @@ function App(): React.JSX.Element {
         console.info(`[User Action Success] Descarga iniciada correctamente para: ${key}`)
         showToast('Iniciando descarga...', 'success')
       } else {
-        console.error(`[Action Failed] Error al descargar video ${key}. Detalles: ${res.error || 'Desconocido'}`)
+        console.error(
+          `[Action Failed] Error al descargar video ${key}. Detalles: ${res.error || 'Desconocido'}`
+        )
         showToast('Error al obtener URL del video', 'error')
       }
     }
   }
 
   const handleDeleteR2Video = async (key: string) => {
-    if (!confirm('¿Estás seguro de que deseas eliminar este video permanentemente?') || !window.electron) return
+    if (
+      !confirm('¿Estás seguro de que deseas eliminar este video permanentemente?') ||
+      !window.electron
+    )
+      return
     console.info(`[User Action] Eliminando video de R2: ${key}`)
     const res = await window.electron.ipcRenderer.invoke('r2:delete-video', key)
     if (res.success) {
@@ -470,6 +576,40 @@ function App(): React.JSX.Element {
     }
   }, [appScale, config])
 
+  useEffect(() => {
+    if (!window.electron) return
+
+    const loadVersion = async () => {
+      const version = await window.electron.ipcRenderer.invoke('config:get-version')
+      setAppVersion(String(version || ''))
+    }
+
+    const handleUpdaterEvent = (_event: unknown, event: UpdaterEvent) => {
+      setUpdaterEvent((previous) => ({ ...previous, ...event }))
+      if (
+        event.status === 'available' ||
+        event.status === 'downloaded' ||
+        event.status === 'blocked'
+      ) {
+        const skippedVersion = event.version ? localStorage.getItem('updateSkippedVersion') : null
+        if (event.status !== 'available' || skippedVersion !== event.version) {
+          setUpdateModalOpen(true)
+        }
+      }
+    }
+
+    void loadVersion()
+    window.electron.ipcRenderer.on('updater:event', handleUpdaterEvent)
+    void window.electron.ipcRenderer
+      .invoke('updater:get-state')
+      .then((event: UpdaterEvent | null) => {
+        if (event) handleUpdaterEvent(null, event)
+      })
+    return () => {
+      window.electron.ipcRenderer.removeAllListeners('updater:event')
+    }
+  }, [])
+
   // Load settings on mount
   useEffect(() => {
     const loadSettings = async () => {
@@ -505,107 +645,128 @@ function App(): React.JSX.Element {
   }, [])
 
   // Fetch all initial data
-  const fetchData = async (profileId?: string) => {
-    setLoadingDb(true)
-    try {
-      const activeProfileId = profileId || sessionUser?.id
-      // Check FFmpeg
-      if (window.electron) {
-        const ffmpeg = await window.electron.ipcRenderer.invoke('ffmpeg:check')
-        setFfmpegStatus(ffmpeg)
-      }
+  const fetchData = async (profileId?: string): Promise<void> => {
+    const requestedProfileId = profileId || sessionUserRef.current?.id || sessionUser?.id
+    if (refreshInFlightRef.current) {
+      refreshQueuedRef.current = true
+      return refreshInFlightRef.current
+    }
 
-      // Load Config
-      if (window.electron) {
-        const savedConfig = await window.electron.ipcRenderer.invoke('config:get')
-        setConfig(savedConfig)
-      }
-
-      // Load Bucket Usage
-      if (window.electron) {
-        const usageRes = await window.electron.ipcRenderer.invoke('config:get-bucket-usage')
-        if (usageRes.success) {
-          setBucketUsageBytes(usageRes.usageBytes)
+    const operation = (async (): Promise<void> => {
+      setLoadingDb(true)
+      try {
+        const activeProfileId = requestedProfileId || sessionUserRef.current?.id || sessionUser?.id
+        // Check FFmpeg
+        if (window.electron) {
+          const ffmpeg = await window.electron.ipcRenderer.invoke('ffmpeg:check')
+          setFfmpegStatus(ffmpeg)
         }
-      }
 
-      // Load Auto-start
-      if (window.electron) {
-        const startup = await window.electron.ipcRenderer.invoke('config:get-startup')
-        setLaunchOnStartup(startup)
-      }
-
-      // Refresh Profile Data
-      const { data: sessionData } = await supabase.auth.getSession()
-      if (sessionData.session?.user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url')
-          .eq('id', sessionData.session.user.id)
-          .maybeSingle()
-          
-        if (profile) {
-          setIsConfigured(profile.is_configured)
-          setProfileName(profile.full_name || sessionData.session.user.email || 'Operador')
-          if (profile.club_name) setClubName(profile.club_name)
-          if (profile.club_role) setClubRole(profile.club_role)
-          if (profile.subscription_type) setSubType(profile.subscription_type.toLowerCase() as any)
-          if (profile.subscription_expiry) setSubExpiry(new Date(profile.subscription_expiry).toLocaleDateString())
-          else setSubExpiry('N/A')
-          
-          if (profile.avatar_url) setProfileAvatar(profile.avatar_url)
-          else setProfileAvatar('')
-          
-          if (window.electron) {
-            window.electron.ipcRenderer.send('window:set-title', `ViewPadel - ${profile.full_name || sessionData.session.user.email}`)
-          }
+        // Load Config
+        if (window.electron) {
+          const savedConfig = await window.electron.ipcRenderer.invoke('config:get')
+          setConfig(savedConfig)
         }
-      }
 
-      // Load local courts and cloud matches for the active profile.
-      if (window.electron && activeProfileId) {
-        const courtsRes = await window.electron.ipcRenderer.invoke('courts:list', activeProfileId)
-        if (courtsRes.success) {
-          setCourts(courtsRes.data)
-          if (courtsRes.data.length > 0 && !newMatch.court_id) {
-            setNewMatch((prev) => ({ ...prev, court_id: courtsRes.data[0].id }))
-          }
+        // Load Bucket Usage
+        if (window.electron) {
+          const usageRes = await window.electron.ipcRenderer.invoke('config:get-bucket-usage')
+          if (usageRes.success) setBucketUsageBytes(usageRes.usageBytes)
+        }
 
-          const rtspDict: Record<string, string> = {}
-          for (const court of courtsRes.data) {
-            rtspDict[court.id] = await window.electron.ipcRenderer.invoke(
-              'config:get-rtsp',
-              court.id,
-              activeProfileId
+        // Load Auto-start
+        if (window.electron) {
+          const startup = await window.electron.ipcRenderer.invoke('config:get-startup')
+          setLaunchOnStartup(startup)
+        }
+
+        // Refresh Profile Data
+        const { data: sessionData } = await supabase.auth.getSession()
+        if (sessionData.session?.user) {
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select(
+              'is_configured, full_name, club_name, club_role, subscription_type, subscription_expiry, avatar_url'
             )
+            .eq('id', sessionData.session.user.id)
+            .maybeSingle()
+
+          if (profile) {
+            setIsConfigured(profile.is_configured)
+            setProfileName(profile.full_name || sessionData.session.user.email || 'Operador')
+            if (profile.club_name) setClubName(profile.club_name)
+            if (profile.club_role) setClubRole(profile.club_role)
+            if (profile.subscription_type)
+              setSubType(profile.subscription_type.toLowerCase() as any)
+            if (profile.subscription_expiry)
+              setSubExpiry(new Date(profile.subscription_expiry).toLocaleDateString())
+            else setSubExpiry('N/A')
+            if (profile.avatar_url) setProfileAvatar(profile.avatar_url)
+            else setProfileAvatar('')
+
+            if (window.electron) {
+              window.electron.ipcRenderer.send(
+                'window:set-title',
+                `ViewPadel - ${profile.full_name || sessionData.session.user.email}`
+              )
+            }
           }
-          setCourtRtspUrls(rtspDict)
-        } else {
-          console.error(courtsRes.error)
         }
 
-        const matchesRes = await window.electron.ipcRenderer.invoke(
-          'db:get-matches',
-          activeProfileId
-        )
-        if (matchesRes.success) {
-          setMatches(matchesRes.data)
-        } else {
-          console.error(matchesRes.error)
-        }
+        // Load local courts and cloud matches for the active profile.
+        if (window.electron && activeProfileId) {
+          const courtsRes = await window.electron.ipcRenderer.invoke('courts:list', activeProfileId)
+          if (courtsRes.success) {
+            setCourts(courtsRes.data)
+            if (courtsRes.data.length > 0 && !newMatch.court_id) {
+              setNewMatch((prev) => ({ ...prev, court_id: courtsRes.data[0].id }))
+            }
 
-        const r2Res = await window.electron.ipcRenderer.invoke('r2:list-videos')
-        if (r2Res.success) {
-          // ensure lastModified is parsed as Date if it comes as string over IPC
-          setR2Videos(r2Res.videos.map((v: any) => ({ ...v, lastModified: new Date(v.lastModified) })))
-        } else {
-          console.error(r2Res.error)
+            const rtspDict: Record<string, string> = {}
+            for (const court of courtsRes.data) {
+              rtspDict[court.id] = await window.electron.ipcRenderer.invoke(
+                'config:get-rtsp',
+                court.id,
+                activeProfileId
+              )
+            }
+            setCourtRtspUrls(rtspDict)
+          } else {
+            console.error(courtsRes.error)
+          }
+
+          const matchesRes = await window.electron.ipcRenderer.invoke(
+            'db:get-matches',
+            activeProfileId
+          )
+          if (matchesRes.success) setMatches(matchesRes.data)
+          else console.error(matchesRes.error)
+
+          const r2Res = await window.electron.ipcRenderer.invoke('r2:list-videos')
+          if (r2Res.success) {
+            setR2Videos(
+              r2Res.videos.map((v: any) => ({ ...v, lastModified: new Date(v.lastModified) }))
+            )
+          } else {
+            console.error(r2Res.error)
+          }
         }
+      } catch (err) {
+        console.error('Error fetching dashboard data:', err)
+      } finally {
+        setLoadingDb(false)
       }
-    } catch (err) {
-      console.error('Error fetching dashboard data:', err)
+    })()
+
+    refreshInFlightRef.current = operation
+    try {
+      await operation
     } finally {
-      setLoadingDb(false)
+      if (refreshInFlightRef.current === operation) refreshInFlightRef.current = null
+      if (refreshQueuedRef.current) {
+        refreshQueuedRef.current = false
+        void fetchData(sessionUserRef.current?.id)
+      }
     }
   }
 
@@ -613,7 +774,7 @@ function App(): React.JSX.Element {
   // but we still want to setup listeners
   useEffect(() => {
     if (!window.electron) return
-    
+
     // Listen to real-time events from scheduler/main process
     const handleRecProgress = (_event: any, data: ActiveRecording) => {
       setActiveRecordings((prev) => ({
@@ -629,21 +790,30 @@ function App(): React.JSX.Element {
       }))
     }
 
+    const refreshCurrentProfile = () => {
+      void fetchData(sessionUserRef.current?.id)
+    }
+
     const handleMatchUpdated = (_event: any) => {
-      fetchData()
+      refreshCurrentProfile()
     }
 
     const handleConfigError = (_event: any, msg: string) => {
       setConfigError(msg)
     }
 
+    const refreshInterval = window.setInterval(refreshCurrentProfile, 30000)
+    window.addEventListener('focus', refreshCurrentProfile)
+    window.addEventListener('online', refreshCurrentProfile)
     window.electron.ipcRenderer.on('recording-progress', handleRecProgress)
     window.electron.ipcRenderer.on('upload-progress', handleUploadProgress)
     window.electron.ipcRenderer.on('match-updated', handleMatchUpdated)
     window.electron.ipcRenderer.on('config-error', handleConfigError)
 
     return () => {
-      // Clean listeners
+      window.clearInterval(refreshInterval)
+      window.removeEventListener('focus', refreshCurrentProfile)
+      window.removeEventListener('online', refreshCurrentProfile)
       if (window.electron) {
         window.electron.ipcRenderer.removeAllListeners('recording-progress')
         window.electron.ipcRenderer.removeAllListeners('upload-progress')
@@ -652,26 +822,6 @@ function App(): React.JSX.Element {
       }
     }
   }, [])
-
-  // Save specific court RTSP url
-  const handleSaveCourtRtsp = async (courtId: string, url: string) => {
-    if (!window.electron) return
-    console.info(`[User Action] Guardando URL RTSP para la cancha: ${courtId}`)
-    const res = await window.electron.ipcRenderer.invoke(
-      'config:save-rtsp',
-      courtId,
-      url,
-      sessionUser?.id
-    )
-    if (res.success) {
-      console.info(`[User Action Success] URL guardada exitosamente para la cancha: ${courtId}`)
-      setCourtRtspUrls((prev) => ({ ...prev, [courtId]: url }))
-      showToast('URL RTSP de la cancha guardada.', 'success')
-    } else {
-      console.error(`[Action Failed] Error al guardar URL RTSP para la cancha: ${courtId}. Detalles: ${res.error}`)
-      showToast(`Error al guardar RTSP: ${res.error}`, 'error')
-    }
-  }
 
   // Create new court
   const handleCreateCourt = async (e: React.FormEvent) => {
@@ -691,7 +841,9 @@ function App(): React.JSX.Element {
       setNewCourt({ name: '', rtsp_url: '' })
       fetchData()
     } else {
-      console.error(`[Action Failed] Error al crear la cancha ${newCourt.name}. Detalles: ${res.error}`)
+      console.error(
+        `[Action Failed] Error al crear la cancha ${newCourt.name}. Detalles: ${res.error}`
+      )
       showToast(`Error: ${res.error}`, 'error')
     }
   }
@@ -751,7 +903,9 @@ function App(): React.JSX.Element {
       setCourtToDelete(null)
       fetchData()
     } else {
-      console.error(`[Action Failed] Error al eliminar cancha ID ${courtId}. Detalles: ${res.error}`)
+      console.error(
+        `[Action Failed] Error al eliminar cancha ID ${courtId}. Detalles: ${res.error}`
+      )
       showToast(`Error al eliminar cancha: ${res.error}`, 'error')
     }
   }
@@ -766,7 +920,9 @@ function App(): React.JSX.Element {
       return
     }
 
-    console.info(`[User Action] Agendando partido para ${player_name} en cancha ${court_id} para el ${date} a las ${time}`)
+    console.info(
+      `[User Action] Agendando partido para ${player_name} en cancha ${court_id} para el ${date} a las ${time}`
+    )
 
     // Phone Pre-fill validation (Argentina code +549 prefixing)
     let formattedPhone = player_phone.trim().replace(/\s+/g, '')
@@ -781,13 +937,17 @@ function App(): React.JSX.Element {
     const startTime = new Date(`${date}T${time}:00`)
     const endTime = new Date(startTime.getTime() + parseInt(duration) * 60000)
 
-    const res = await window.electron.ipcRenderer.invoke('db:create-match', {
-      court_id,
-      start_time: startTime.toISOString(),
-      end_time: endTime.toISOString(),
-      player_name,
-      player_phone: formattedPhone
-    }, sessionUser?.id)
+    const res = await window.electron.ipcRenderer.invoke(
+      'db:create-match',
+      {
+        court_id,
+        start_time: startTime.toISOString(),
+        end_time: endTime.toISOString(),
+        player_name,
+        player_phone: formattedPhone
+      },
+      sessionUser?.id
+    )
 
     if (res.success) {
       console.info(`[User Action Success] Partido agendado correctamente para ${player_name}.`)
@@ -802,7 +962,9 @@ function App(): React.JSX.Element {
       })
       fetchData()
     } else {
-      console.error(`[Action Failed] Error al agendar partido para ${player_name}. Detalles: ${res.error}`)
+      console.error(
+        `[Action Failed] Error al agendar partido para ${player_name}. Detalles: ${res.error}`
+      )
       showToast(`Error al agendar partido: ${res.error}`, 'error')
     }
   }
@@ -811,7 +973,9 @@ function App(): React.JSX.Element {
   const handleStartRecordingOnDemand = async (courtId: string) => {
     if (!window.electron || !sessionUser?.id || startingRecordings[courtId]) return
     setStartingRecordings((current) => ({ ...current, [courtId]: true }))
-    console.info(`[User Action] Iniciando grabación manual en demanda para la cancha ID: ${courtId}`)
+    console.info(
+      `[User Action] Iniciando grabación manual en demanda para la cancha ID: ${courtId}`
+    )
 
     try {
       const res = await window.electron.ipcRenderer.invoke('recordings:start', {
@@ -820,7 +984,9 @@ function App(): React.JSX.Element {
       })
 
       if (res.success) {
-        console.info(`[User Action Success] Grabación manual iniciada correctamente en cancha ID: ${courtId}`)
+        console.info(
+          `[User Action Success] Grabación manual iniciada correctamente en cancha ID: ${courtId}`
+        )
         showToast(
           res.alreadyActive
             ? 'La grabación manual ya estaba iniciada.'
@@ -829,7 +995,9 @@ function App(): React.JSX.Element {
         )
         await fetchData()
       } else {
-        console.error(`[Action Failed] Error al iniciar la cancha ${courtId}. Detalles: ${res.error}`)
+        console.error(
+          `[Action Failed] Error al iniciar la cancha ${courtId}. Detalles: ${res.error}`
+        )
         showToast(`Error al iniciar grabación: ${res.error}`, 'error')
       }
     } finally {
@@ -855,7 +1023,9 @@ function App(): React.JSX.Element {
       showToast('Partido eliminado.', 'success')
       fetchData()
     } else {
-      console.error(`[Action Failed] Error al eliminar partido ID: ${matchId}. Detalles: ${res.error}`)
+      console.error(
+        `[Action Failed] Error al eliminar partido ID: ${matchId}. Detalles: ${res.error}`
+      )
       showToast(`Error: ${res.error}`, 'error')
     }
   }
@@ -865,16 +1035,21 @@ function App(): React.JSX.Element {
     if (
       !confirm(
         '¿Detener esta grabación manualmente? Se subirá el video parcial obtenido hasta el momento.'
-      ) || !window.electron
+      ) ||
+      !window.electron
     )
       return
-    console.info(`[User Action] Deteniendo grabación activa manualmente para el partido ID: ${matchId}`)
+    console.info(
+      `[User Action] Deteniendo grabación activa manualmente para el partido ID: ${matchId}`
+    )
     const res = await window.electron.ipcRenderer.invoke('recordings:kill', {
       matchId,
       profileId: sessionUser?.id
     })
     if (res.success) {
-      console.info(`[User Action Success] Grabación detenida correctamente para partido ID: ${matchId}`)
+      console.info(
+        `[User Action Success] Grabación detenida correctamente para partido ID: ${matchId}`
+      )
       showToast('Grabación detenida. Iniciando procesamiento...', 'info')
       setActiveRecordings((prev) => {
         const copy = { ...prev }
@@ -903,7 +1078,9 @@ function App(): React.JSX.Element {
       })
       fetchData()
     } else {
-      console.error(`[Action Failed] No se pudo cancelar subida para partido ID: ${matchId}. Detalles: ${res?.error || 'Desconocido'}`)
+      console.error(
+        `[Action Failed] No se pudo cancelar subida para partido ID: ${matchId}. Detalles: ${res?.error || 'Desconocido'}`
+      )
     }
   }
 
@@ -935,15 +1112,18 @@ function App(): React.JSX.Element {
   // Save profile settings
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault()
-    
+
     // Save to DB
     const { data: sessionData } = await supabase.auth.getSession()
     if (sessionData.session?.user) {
-      const { error } = await supabase.from('profiles').update({
-        full_name: profileName,
-        avatar_url: profileAvatar
-      }).eq('id', sessionData.session.user.id)
-      
+      const { error } = await supabase
+        .from('profiles')
+        .update({
+          full_name: profileName,
+          avatar_url: profileAvatar
+        })
+        .eq('id', sessionData.session.user.id)
+
       if (error) {
         showToast('Error al guardar en la base de datos: ' + error.message, 'error')
         return
@@ -997,10 +1177,19 @@ function App(): React.JSX.Element {
 
   if (isLoggedIn && isConfigured === false) {
     return (
-      <div style={{
-        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh',
-        backgroundColor: '#0B0F19', color: 'white', padding: '20px', position: 'relative'
-      }}>
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          minHeight: '100vh',
+          backgroundColor: '#0B0F19',
+          color: 'white',
+          padding: '20px',
+          position: 'relative'
+        }}
+      >
         {/* CSS inyectado localmente para el fondo y animaciones */}
         <style>{`
           @keyframes fade-in {
@@ -1036,55 +1225,105 @@ function App(): React.JSX.Element {
             50% { opacity: .5; }
           }
         `}</style>
-        
+
         <div className="page-bg">
           <div className="bg-orb orb-1"></div>
           <div className="bg-orb orb-2"></div>
           <div className="grid-lines"></div>
         </div>
 
-        <div className="block-fade-in" style={{
-          backgroundColor: 'rgba(15, 23, 42, 0.6)', padding: '50px 40px', borderRadius: '24px', width: '100%', maxWidth: '480px', textAlign: 'center',
-          backdropFilter: 'blur(20px)', border: '1px solid rgba(245,158,11,0.2)', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)', zIndex: 1
-        }}>
-          
-          <div className="pulse-warning" style={{
-            width: '80px', height: '80px', borderRadius: '50%', backgroundColor: 'rgba(245,158,11,0.1)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 24px auto',
-            border: '1px solid rgba(245,158,11,0.2)'
-          }}>
+        <div
+          className="block-fade-in"
+          style={{
+            backgroundColor: 'rgba(15, 23, 42, 0.6)',
+            padding: '50px 40px',
+            borderRadius: '24px',
+            width: '100%',
+            maxWidth: '480px',
+            textAlign: 'center',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(245,158,11,0.2)',
+            boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)',
+            zIndex: 1
+          }}
+        >
+          <div
+            className="pulse-warning"
+            style={{
+              width: '80px',
+              height: '80px',
+              borderRadius: '50%',
+              backgroundColor: 'rgba(245,158,11,0.1)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              margin: '0 auto 24px auto',
+              border: '1px solid rgba(245,158,11,0.2)'
+            }}
+          >
             <AlertTriangle size={40} color="#f59e0b" />
           </div>
 
-          <h2 style={{ fontSize: '28px', fontWeight: 'bold', margin: '0 0 16px 0', color: '#f8fafc' }}>
+          <h2
+            style={{ fontSize: '28px', fontWeight: 'bold', margin: '0 0 16px 0', color: '#f8fafc' }}
+          >
             Cuenta en Proceso de Alta
           </h2>
-          
-          <p style={{ color: '#94a3b8', fontSize: '15px', marginBottom: '32px', lineHeight: '1.6' }}>
-            Estamos configurando tu infraestructura de almacenamiento en la nube y asignando tus recursos de procesamiento. 
-            Una vez que nuestro equipo asigne tu bucket, la aplicación se desbloqueará automáticamente.
+
+          <p
+            style={{ color: '#94a3b8', fontSize: '15px', marginBottom: '32px', lineHeight: '1.6' }}
+          >
+            Estamos configurando tu infraestructura de almacenamiento en la nube y asignando tus
+            recursos de procesamiento. Una vez que nuestro equipo asigne tu bucket, la aplicación se
+            desbloqueará automáticamente.
           </p>
-          
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            <button 
-              onClick={() => supabase.auth.getSession().then(({ data }) => data.session && handleLoginSuccess(data.session))} 
+            <button
+              onClick={() =>
+                supabase.auth
+                  .getSession()
+                  .then(({ data }) => data.session && handleLoginSuccess(data.session))
+              }
               style={{
-                width: '100%', backgroundColor: '#3b82f6', color: 'white', padding: '14px', borderRadius: '12px',
-                fontSize: '15px', fontWeight: '600', border: 'none', cursor: 'pointer', transition: 'background 0.2s'
+                width: '100%',
+                backgroundColor: '#3b82f6',
+                color: 'white',
+                padding: '14px',
+                borderRadius: '12px',
+                fontSize: '15px',
+                fontWeight: '600',
+                border: 'none',
+                cursor: 'pointer',
+                transition: 'background 0.2s'
               }}
               onMouseOver={(e) => (e.currentTarget.style.backgroundColor = '#2563eb')}
               onMouseOut={(e) => (e.currentTarget.style.backgroundColor = '#3b82f6')}
             >
               Verificar Estado Ahora
             </button>
-            <button 
-              onClick={handleLogout} 
+            <button
+              onClick={handleLogout}
               style={{
-                width: '100%', backgroundColor: 'transparent', color: '#94a3b8', padding: '14px', borderRadius: '12px',
-                fontSize: '15px', fontWeight: '600', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer', transition: 'all 0.2s'
+                width: '100%',
+                backgroundColor: 'transparent',
+                color: '#94a3b8',
+                padding: '14px',
+                borderRadius: '12px',
+                fontSize: '15px',
+                fontWeight: '600',
+                border: '1px solid rgba(255,255,255,0.1)',
+                cursor: 'pointer',
+                transition: 'all 0.2s'
               }}
-              onMouseOver={(e) => { e.currentTarget.style.color = 'white'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.3)' }}
-              onMouseOut={(e) => { e.currentTarget.style.color = '#94a3b8'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)' }}
+              onMouseOver={(e) => {
+                e.currentTarget.style.color = 'white'
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.3)'
+              }}
+              onMouseOut={(e) => {
+                e.currentTarget.style.color = '#94a3b8'
+                e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'
+              }}
             >
               Cerrar Sesión
             </button>
@@ -1117,14 +1356,36 @@ function App(): React.JSX.Element {
                 title="Desplegar menú"
                 style={{ padding: '0', background: 'transparent', boxShadow: 'none' }}
               >
-                <img src={logoPng} alt="ViewPadel Logo" style={{ width: '32px', height: '32px', objectFit: 'contain', marginLeft: '2px', filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))' }} />
+                <img
+                  src={logoPng}
+                  alt="ViewPadel Logo"
+                  style={{
+                    width: '32px',
+                    height: '32px',
+                    objectFit: 'contain',
+                    marginLeft: '2px',
+                    filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))'
+                  }}
+                />
                 <span className="logo-chevron-icon">
                   <ChevronRight size={20} />
                 </span>
               </button>
             ) : (
-              <div className="brand-logo-static" style={{ background: 'transparent', boxShadow: 'none' }}>
-                <img src={logoPng} alt="ViewPadel Logo" style={{ width: '36px', height: '36px', objectFit: 'contain', filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))' }} />
+              <div
+                className="brand-logo-static"
+                style={{ background: 'transparent', boxShadow: 'none' }}
+              >
+                <img
+                  src={logoPng}
+                  alt="ViewPadel Logo"
+                  style={{
+                    width: '36px',
+                    height: '36px',
+                    objectFit: 'contain',
+                    filter: 'drop-shadow(0 0 10px rgba(16, 185, 129, 0.5))'
+                  }}
+                />
               </div>
             )}
 
@@ -1230,7 +1491,11 @@ function App(): React.JSX.Element {
               {clubName} - {profileName}
             </div>
           </div>
-          <button className="btn btn-secondary btn-icon" onClick={() => fetchData()} disabled={loadingDb}>
+          <button
+            className="btn btn-secondary btn-icon"
+            onClick={() => fetchData()}
+            disabled={loadingDb}
+          >
             <RefreshCw size={16} className={loadingDb ? 'spin' : ''} />
             <span>Sincronizar</span>
           </button>
@@ -1261,6 +1526,140 @@ function App(): React.JSX.Element {
             </button>
           </div>
         )}
+
+        {updateModalOpen &&
+          updaterEvent &&
+          (() => {
+            const changelog = getChangelogEntry(updaterEvent.version)
+            const isDownloading = updaterEvent.status === 'downloading'
+            const isDownloaded = updaterEvent.status === 'downloaded'
+            const isBlocked = updaterEvent.status === 'blocked'
+            const title = isDownloaded
+              ? 'Actualización lista'
+              : isBlocked
+                ? 'Actualización pendiente'
+                : 'Nueva versión disponible'
+            const description = isDownloaded
+              ? 'La actualización se descargó correctamente y está lista para instalarse.'
+              : isBlocked
+                ? updaterEvent.message ||
+                  'La instalación espera a que terminen las operaciones activas.'
+                : `Está disponible la versión ${updaterEvent.version || 'nueva'} de ViewPadel.`
+
+            return (
+              <div className="modal-overlay" onClick={handleUpdateLater}>
+                <div
+                  className="modal-content"
+                  onClick={(event) => event.stopPropagation()}
+                  style={{ maxWidth: '560px', width: '92%' }}
+                >
+                  <button className="modal-close-btn" onClick={handleUpdateLater} type="button">
+                    <XCircle size={20} />
+                  </button>
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '12px',
+                      marginBottom: '16px'
+                    }}
+                  >
+                    <div className="banner-icon success">
+                      <RefreshCw size={24} />
+                    </div>
+                    <div>
+                      <h3 className="card-title" style={{ margin: 0 }}>
+                        {title}
+                      </h3>
+                      <p className="text-muted text-sm" style={{ margin: '4px 0 0' }}>
+                        Versión actual: {appVersion || 'desconocida'}
+                        {updaterEvent.version ? ` · Nueva: ${updaterEvent.version}` : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <p style={{ lineHeight: 1.5, marginBottom: '18px' }}>{description}</p>
+
+                  <div className="card-pane" style={{ marginBottom: '20px' }}>
+                    <h4 style={{ margin: '0 0 10px' }}>{changelog.title}</h4>
+                    <ul style={{ margin: 0, paddingLeft: '20px', lineHeight: 1.7 }}>
+                      {changelog.items.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {isDownloading && (
+                    <div style={{ marginBottom: '18px' }}>
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          marginBottom: '6px'
+                        }}
+                      >
+                        <span className="text-muted text-sm">Descargando actualización...</span>
+                        <span className="text-muted text-sm">
+                          {Math.round(updaterEvent.percent || 0)}%
+                        </span>
+                      </div>
+                      <div className="progress-bar-bg">
+                        <div
+                          className="progress-bar-fill success"
+                          style={{ width: `${Math.min(updaterEvent.percent || 0, 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'flex-end',
+                      gap: '10px',
+                      flexWrap: 'wrap'
+                    }}
+                  >
+                    {!isDownloaded && !isBlocked && !isDownloading && (
+                      <button
+                        className="btn btn-outline-danger"
+                        type="button"
+                        onClick={handleSkipUpdate}
+                      >
+                        No actualizar
+                      </button>
+                    )}
+                    {!isDownloaded && !isBlocked && !isDownloading && (
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={handleUpdateLater}
+                      >
+                        Más tarde
+                      </button>
+                    )}
+                    {(isDownloaded ||
+                      isBlocked ||
+                      (!isDownloading && updaterEvent.status === 'available')) && (
+                      <button
+                        className="btn btn-primary"
+                        type="button"
+                        onClick={() => void handleUpdateAction()}
+                        disabled={updateActionBusy}
+                      >
+                        {updateActionBusy
+                          ? 'Procesando...'
+                          : isDownloaded
+                            ? 'Reiniciar y actualizar'
+                            : isBlocked
+                              ? 'Reintentar instalación'
+                              : 'Actualizar ahora'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )
+          })()}
 
         {/* TOAST SYSTEM */}
         {toast && (
@@ -1350,7 +1749,10 @@ function App(): React.JSX.Element {
                                           await handleStartRecordingOnDemand(court.id)
                                         }}
                                       >
-                                        <Play size={12} /> {startingRecordings[court.id] ? 'Iniciando...' : 'Iniciar grabación'}
+                                        <Play size={12} />{' '}
+                                        {startingRecordings[court.id]
+                                          ? 'Iniciando...'
+                                          : 'Iniciar grabación'}
                                       </button>
                                       <button
                                         type="button"
@@ -1483,7 +1885,9 @@ function App(): React.JSX.Element {
                               <div className="upload-info">
                                 <div>
                                   <h4>{match.player_name}</h4>
-                                  <p className="text-muted text-xs">Cancha: {match.court_name || 'Cancha Registrada'}</p>
+                                  <p className="text-muted text-xs">
+                                    Cancha: {match.court_name || 'Cancha Registrada'}
+                                  </p>
                                 </div>
                                 <span className="font-mono text-sm">{percent}%</span>
                               </div>
@@ -1587,8 +1991,10 @@ function App(): React.JSX.Element {
                                       className="btn-icon"
                                       onClick={() => {
                                         const url = `https://padel-view-web-app.vercel.app/partido/${match.id}`
-                                        navigator.clipboard.writeText(url)
-                                        showToast('Enlace copiado al portapapeles.', 'success')
+                                        void copyTextToClipboard(
+                                          url,
+                                          'Enlace copiado al portapapeles.'
+                                        )
                                       }}
                                       title="Copiar enlace"
                                       style={{ color: '#3b82f6' }}
@@ -1634,7 +2040,10 @@ function App(): React.JSX.Element {
                         className="progress-bar-fill"
                         style={{
                           width: `${Math.min((bucketUsageBytes / (10 * 1024 * 1024 * 1024)) * 100, 100)}%`,
-                          backgroundColor: bucketUsageBytes > 8 * 1024 * 1024 * 1024 ? '#ef4444' : 'var(--color-primary)'
+                          backgroundColor:
+                            bucketUsageBytes > 8 * 1024 * 1024 * 1024
+                              ? '#ef4444'
+                              : 'var(--color-primary)'
                         }}
                       ></div>
                     </div>
@@ -1649,29 +2058,75 @@ function App(): React.JSX.Element {
                     </div>
                   ) : (
                     r2Videos.map((video) => (
-                      <div key={video.key} className="video-card card-pane" style={{ padding: '0', overflow: 'hidden' }}>
-                        <div className="video-thumbnail" onClick={() => handlePlayR2Video(video.key)}>
+                      <div
+                        key={video.key}
+                        className="video-card card-pane"
+                        style={{ padding: '0', overflow: 'hidden' }}
+                      >
+                        <div
+                          className="video-thumbnail"
+                          onClick={() => handlePlayR2Video(video.key)}
+                        >
                           <div className="video-thumbnail-overlay">
                             <Play size={40} className="play-icon" />
                           </div>
                           {/* Placeholder thumbnail */}
-                          <div className="thumbnail-placeholder" style={{ aspectRatio: '16/9', background: 'var(--color-bg)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                          <div
+                            className="thumbnail-placeholder"
+                            style={{
+                              aspectRatio: '16/9',
+                              background: 'var(--color-bg)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center'
+                            }}
+                          >
                             <Film size={32} className="text-muted" />
                           </div>
                         </div>
                         <div className="video-info" style={{ padding: '12px' }}>
-                          <h4 style={{ margin: '0 0 4px 0', fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          <h4
+                            style={{
+                              margin: '0 0 4px 0',
+                              fontSize: '14px',
+                              whiteSpace: 'nowrap',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis'
+                            }}
+                          >
                             {video.key.split('/').pop()}
                           </h4>
                           <p className="text-muted text-xs" style={{ margin: '0 0 12px 0' }}>
-                            {video.lastModified.toLocaleDateString()} - {video.lastModified.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {(video.size / (1024 * 1024)).toFixed(2)} MB
+                            {video.lastModified.toLocaleDateString()} -{' '}
+                            {video.lastModified.toLocaleTimeString([], {
+                              hour: '2-digit',
+                              minute: '2-digit'
+                            })}{' '}
+                            • {(video.size / (1024 * 1024)).toFixed(2)} MB
                           </p>
-                          <div className="video-actions" style={{ display: 'flex', justifyContent: 'flex-end', borderTop: '1px solid var(--color-border)', paddingTop: '10px' }}>
+                          <div
+                            className="video-actions"
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'flex-end',
+                              borderTop: '1px solid var(--color-border)',
+                              paddingTop: '10px'
+                            }}
+                          >
                             <div style={{ display: 'flex', gap: '8px' }}>
-                              <button className="btn-icon" style={{ color: '#3b82f6' }} onClick={() => handleDownloadR2Video(video.key)} title="Descargar Video">
+                              <button
+                                className="btn-icon"
+                                style={{ color: '#3b82f6' }}
+                                onClick={() => handleDownloadR2Video(video.key)}
+                                title="Descargar Video"
+                              >
                                 <Download size={16} />
                               </button>
-                              <button className="btn-icon text-danger" onClick={() => handleDeleteR2Video(video.key)} title="Eliminar Video">
+                              <button
+                                className="btn-icon text-danger"
+                                onClick={() => handleDeleteR2Video(video.key)}
+                                title="Eliminar Video"
+                              >
                                 <Trash2 size={16} />
                               </button>
                             </div>
@@ -1685,19 +2140,56 @@ function App(): React.JSX.Element {
 
               {/* Video Playback Modal */}
               {playingVideoId && (
-                <div className="modal-overlay" onClick={() => { setPlayingVideoId(null); setPlayingVideoUrl(null); }}>
-                  <div className="modal-content video-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: '800px', width: '90%' }}>
-                    <button className="modal-close-btn" onClick={() => { setPlayingVideoId(null); setPlayingVideoUrl(null); }}>
+                <div
+                  className="modal-overlay"
+                  onClick={() => {
+                    setPlayingVideoId(null)
+                    setPlayingVideoUrl(null)
+                  }}
+                >
+                  <div
+                    className="modal-content video-modal"
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ maxWidth: '800px', width: '90%' }}
+                  >
+                    <button
+                      className="modal-close-btn"
+                      onClick={() => {
+                        setPlayingVideoId(null)
+                        setPlayingVideoUrl(null)
+                      }}
+                    >
                       <XCircle size={20} />
                     </button>
-                    <h3 className="card-title" style={{ marginBottom: '16px' }}>Reproductor de Video</h3>
-                    <div className="video-player-container" style={{ background: '#000', borderRadius: '8px', overflow: 'hidden', aspectRatio: '16/9', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <h3 className="card-title" style={{ marginBottom: '16px' }}>
+                      Reproductor de Video
+                    </h3>
+                    <div
+                      className="video-player-container"
+                      style={{
+                        background: '#000',
+                        borderRadius: '8px',
+                        overflow: 'hidden',
+                        aspectRatio: '16/9',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}
+                    >
                       {playingVideoUrl ? (
-                        <video key={playingVideoUrl} controls autoPlay src={playingVideoUrl} style={{ width: '100%', height: '100%', display: 'block' }}>
+                        <video
+                          key={playingVideoUrl}
+                          controls
+                          autoPlay
+                          src={playingVideoUrl}
+                          style={{ width: '100%', height: '100%', display: 'block' }}
+                        >
                           Tu navegador no soporta reproducción de video.
                         </video>
                       ) : (
-                        <div style={{ color: 'var(--color-text-secondary)' }}>Cargando reproductor...</div>
+                        <div style={{ color: 'var(--color-text-secondary)' }}>
+                          Cargando reproductor...
+                        </div>
                       )}
                     </div>
                   </div>
@@ -1705,55 +2197,140 @@ function App(): React.JSX.Element {
               )}
 
               {/* Video Info Modal */}
-              {infoVideoId && (() => {
-                const infoMatch = matches.find(m => m.id === infoVideoId);
-                return infoMatch && (
-                  <div className="modal-overlay" onClick={() => setInfoVideoId(null)}>
-                    <div className="modal-content" onClick={e => e.stopPropagation()}>
-                      <button className="modal-close-btn" onClick={() => setInfoVideoId(null)}>
-                        <XCircle size={20} />
-                      </button>
-                      <h3 className="card-title" style={{ marginBottom: '20px' }}>Información del Video</h3>
-                      <div className="info-grid" style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                        <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
-                          <span className="info-label text-secondary text-sm">Cliente:</span>
-                          <span className="info-value font-medium">{infoMatch.player_name} ({infoMatch.player_phone})</span>
-                        </div>
-                        <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
-                          <span className="info-label text-secondary text-sm">Cancha:</span>
-                          <span className="info-value font-medium">{infoMatch.court_name || 'Cancha Registrada'}</span>
-                        </div>
-                        <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
-                          <span className="info-label text-secondary text-sm">Fecha y Hora:</span>
-                          <span className="info-value font-medium">{new Date(infoMatch.start_time).toLocaleString()}</span>
-                        </div>
-                        <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
-                          <span className="info-label text-secondary text-sm">UUID:</span>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span className="info-value font-mono text-xs" style={{ background: 'var(--color-bg)', padding: '4px 8px', borderRadius: '4px' }}>{infoMatch.id}</span>
-                            <button className="btn-icon" style={{ padding: '4px' }} onClick={() => { navigator.clipboard.writeText(infoMatch.id); showToast('UUID copiado', 'success'); }} title="Copiar UUID">
-                              <Copy size={14} />
-                            </button>
-                          </div>
-                        </div>
-                        <div className="info-item" style={{ display: 'grid', gridTemplateColumns: '120px 1fr', alignItems: 'center' }}>
-                          <span className="info-label text-secondary text-sm">Enlace:</span>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span className="info-value" style={{ wordBreak: 'break-all', fontSize: '13px' }}>
-                              <a href={`https://padel-view-web-app.vercel.app/partido/${infoMatch.id}`} target="_blank" rel="noreferrer" style={{ color: 'var(--color-primary)' }}>
-                                https://padel-view-web-app.vercel.app/partido/{infoMatch.id}
-                              </a>
-                            </span>
-                            <button className="btn-icon" style={{ padding: '4px' }} onClick={() => { navigator.clipboard.writeText(`https://padel-view-web-app.vercel.app/partido/${infoMatch.id}`); showToast('Enlace copiado', 'success'); }} title="Copiar Enlace">
-                              <Copy size={14} />
-                            </button>
+              {infoVideoId &&
+                (() => {
+                  const infoMatch = matches.find((m) => m.id === infoVideoId)
+                  return (
+                    infoMatch && (
+                      <div className="modal-overlay" onClick={() => setInfoVideoId(null)}>
+                        <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+                          <button className="modal-close-btn" onClick={() => setInfoVideoId(null)}>
+                            <XCircle size={20} />
+                          </button>
+                          <h3 className="card-title" style={{ marginBottom: '20px' }}>
+                            Información del Video
+                          </h3>
+                          <div
+                            className="info-grid"
+                            style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}
+                          >
+                            <div
+                              className="info-item"
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: '120px 1fr',
+                                alignItems: 'center'
+                              }}
+                            >
+                              <span className="info-label text-secondary text-sm">Cliente:</span>
+                              <span className="info-value font-medium">
+                                {infoMatch.player_name} ({infoMatch.player_phone})
+                              </span>
+                            </div>
+                            <div
+                              className="info-item"
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: '120px 1fr',
+                                alignItems: 'center'
+                              }}
+                            >
+                              <span className="info-label text-secondary text-sm">Cancha:</span>
+                              <span className="info-value font-medium">
+                                {infoMatch.court_name || 'Cancha Registrada'}
+                              </span>
+                            </div>
+                            <div
+                              className="info-item"
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: '120px 1fr',
+                                alignItems: 'center'
+                              }}
+                            >
+                              <span className="info-label text-secondary text-sm">
+                                Fecha y Hora:
+                              </span>
+                              <span className="info-value font-medium">
+                                {new Date(infoMatch.start_time).toLocaleString()}
+                              </span>
+                            </div>
+                            <div
+                              className="info-item"
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: '120px 1fr',
+                                alignItems: 'center'
+                              }}
+                            >
+                              <span className="info-label text-secondary text-sm">UUID:</span>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <span
+                                  className="info-value font-mono text-xs"
+                                  style={{
+                                    background: 'var(--color-bg)',
+                                    padding: '4px 8px',
+                                    borderRadius: '4px'
+                                  }}
+                                >
+                                  {infoMatch.id}
+                                </span>
+                                <button
+                                  className="btn-icon"
+                                  style={{ padding: '4px' }}
+                                  onClick={() => {
+                                    void copyTextToClipboard(infoMatch.id, 'UUID copiado.')
+                                  }}
+                                  title="Copiar UUID"
+                                >
+                                  <Copy size={14} />
+                                </button>
+                              </div>
+                            </div>
+                            <div
+                              className="info-item"
+                              style={{
+                                display: 'grid',
+                                gridTemplateColumns: '120px 1fr',
+                                alignItems: 'center'
+                              }}
+                            >
+                              <span className="info-label text-secondary text-sm">Enlace:</span>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <span
+                                  className="info-value"
+                                  style={{ wordBreak: 'break-all', fontSize: '13px' }}
+                                >
+                                  <a
+                                    href={`https://padel-view-web-app.vercel.app/partido/${infoMatch.id}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{ color: 'var(--color-primary)' }}
+                                  >
+                                    https://padel-view-web-app.vercel.app/partido/{infoMatch.id}
+                                  </a>
+                                </span>
+                                <button
+                                  className="btn-icon"
+                                  style={{ padding: '4px' }}
+                                  onClick={() => {
+                                    void copyTextToClipboard(
+                                      `https://padel-view-web-app.vercel.app/partido/${infoMatch.id}`,
+                                      'Enlace copiado.'
+                                    )
+                                  }}
+                                  title="Copiar Enlace"
+                                >
+                                  <Copy size={14} />
+                                </button>
+                              </div>
+                            </div>
                           </div>
                         </div>
                       </div>
-                    </div>
-                  </div>
-                );
-              })()}
+                    )
+                  )
+                })()}
             </div>
           )}
 
@@ -1920,10 +2497,7 @@ function App(): React.JSX.Element {
                 <h3 className="section-title" style={{ margin: 0 }}>
                   Canchas
                 </h3>
-                <button
-                  className="btn btn-primary btn-sm"
-                  onClick={beginCourtRegistration}
-                >
+                <button className="btn btn-primary btn-sm" onClick={beginCourtRegistration}>
                   <Plus size={16} style={{ marginRight: '6px' }} />
                   Registrar Cancha
                 </button>
@@ -1933,10 +2507,7 @@ function App(): React.JSX.Element {
                 <div className="empty-state">
                   <Video size={48} className="text-muted" />
                   <p>No hay canchas configuradas en este club.</p>
-                  <button
-                    className="btn btn-primary btn-sm"
-                    onClick={beginCourtRegistration}
-                  >
+                  <button className="btn btn-primary btn-sm" onClick={beginCourtRegistration}>
                     Registrar Primera Cancha
                   </button>
                 </div>
@@ -2032,9 +2603,10 @@ function App(): React.JSX.Element {
                                           court.video_source?.type === 'direct-camera'
                                             ? courtRtspUrls[court.id] || ''
                                             : '',
-                                        video_source: court.video_source?.type === 'recorder'
-                                          ? court.video_source
-                                          : undefined
+                                        video_source:
+                                          court.video_source?.type === 'recorder'
+                                            ? court.video_source
+                                            : undefined
                                       })
                                       setIsCreateCourtModalOpen(true)
                                     }}
@@ -2129,9 +2701,15 @@ function App(): React.JSX.Element {
                           <div className="card-pane" style={{ padding: '12px' }}>
                             <strong>DVR / NVR</strong>
                             <p className="text-muted text-sm" style={{ margin: '6px 0 10px' }}>
-                              Canal {newCourt.video_source.channelNumber || newCourt.video_source.channelId}
+                              Canal{' '}
+                              {newCourt.video_source.channelNumber ||
+                                newCourt.video_source.channelId}
                             </p>
-                            <button type="button" className="btn btn-secondary btn-sm" onClick={chooseRecorder}>
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm"
+                              onClick={chooseRecorder}
+                            >
                               Cambiar canal
                             </button>
                           </div>
@@ -2141,7 +2719,9 @@ function App(): React.JSX.Element {
                               type="text"
                               placeholder="rtsp://usuario:contraseña@ip:puerto/h264"
                               value={newCourt.rtsp_url}
-                              onChange={(e) => setNewCourt({ ...newCourt, rtsp_url: e.target.value })}
+                              onChange={(e) =>
+                                setNewCourt({ ...newCourt, rtsp_url: e.target.value })
+                              }
                             />
                             <button
                               type="button"
@@ -2166,7 +2746,11 @@ function App(): React.JSX.Element {
                               compact
                             />
                           ) : newCourt.rtsp_url ? (
-                            <VideoSourcePreview courtId="preview-camera" rtspUrl={newCourt.rtsp_url} compact />
+                            <VideoSourcePreview
+                              courtId="preview-camera"
+                              rtspUrl={newCourt.rtsp_url}
+                              compact
+                            />
                           ) : (
                             <div
                               style={{
@@ -2180,7 +2764,9 @@ function App(): React.JSX.Element {
                                 justifyContent: 'center'
                               }}
                             >
-                              <span className="text-muted text-sm">Ingresá una URL RTSP para previsualizar</span>
+                              <span className="text-muted text-sm">
+                                Ingresá una URL RTSP para previsualizar
+                              </span>
                             </div>
                           )}
                         </div>
@@ -2208,28 +2794,65 @@ function App(): React.JSX.Element {
 
               {isSourceTypeModalOpen && (
                 <div className="modal-overlay" onClick={() => setIsSourceTypeModalOpen(false)}>
-                  <div className="modal-content" onClick={(event) => event.stopPropagation()} style={{ width: '680px', maxWidth: '92vw' }}>
-                    <button className="modal-close-btn" onClick={() => setIsSourceTypeModalOpen(false)} type="button">
+                  <div
+                    className="modal-content"
+                    onClick={(event) => event.stopPropagation()}
+                    style={{ width: '680px', maxWidth: '92vw' }}
+                  >
+                    <button
+                      className="modal-close-btn"
+                      onClick={() => setIsSourceTypeModalOpen(false)}
+                      type="button"
+                    >
                       <XCircle size={20} />
                     </button>
-                    <h3 className="card-title" style={{ marginBottom: '8px' }}>¿Cómo está conectada la cámara?</h3>
+                    <h3 className="card-title" style={{ marginBottom: '8px' }}>
+                      ¿Cómo está conectada la cámara?
+                    </h3>
                     <p className="text-muted text-sm" style={{ marginBottom: '20px' }}>
-                      Elegí el tipo de fuente para mantener separado el flujo de cámaras IP del flujo de grabadores.
+                      Elegí el tipo de fuente para mantener separado el flujo de cámaras IP del
+                      flujo de grabadores.
                     </p>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
-                      <button type="button" className="card-pane" onClick={chooseDirectCamera} style={{ textAlign: 'left', padding: '18px', cursor: 'pointer' }}>
-                        <Video size={24} style={{ color: 'var(--color-primary)', marginBottom: '10px' }} />
+                      <button
+                        type="button"
+                        className="card-pane"
+                        onClick={chooseDirectCamera}
+                        style={{ textAlign: 'left', padding: '18px', cursor: 'pointer' }}
+                      >
+                        <Video
+                          size={24}
+                          style={{ color: 'var(--color-primary)', marginBottom: '10px' }}
+                        />
                         <strong style={{ display: 'block' }}>Cámara IP</strong>
-                        <span className="text-muted text-sm">Cámara conectada directamente a la red local.</span>
+                        <span className="text-muted text-sm">
+                          Cámara conectada directamente a la red local.
+                        </span>
                       </button>
-                      <button type="button" className="card-pane" onClick={chooseRecorder} style={{ textAlign: 'left', padding: '18px', cursor: 'pointer' }}>
-                        <Grid size={24} style={{ color: 'var(--color-primary)', marginBottom: '10px' }} />
+                      <button
+                        type="button"
+                        className="card-pane"
+                        onClick={chooseRecorder}
+                        style={{ textAlign: 'left', padding: '18px', cursor: 'pointer' }}
+                      >
+                        <Grid
+                          size={24}
+                          style={{ color: 'var(--color-primary)', marginBottom: '10px' }}
+                        />
                         <strong style={{ display: 'block' }}>DVR / NVR</strong>
-                        <span className="text-muted text-sm">Cámara administrada por un grabador y sus canales.</span>
+                        <span className="text-muted text-sm">
+                          Cámara administrada por un grabador y sus canales.
+                        </span>
                       </button>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
-                      <button className="btn btn-secondary" type="button" onClick={() => setIsSourceTypeModalOpen(false)}>Cancelar</button>
+                      <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={() => setIsSourceTypeModalOpen(false)}
+                      >
+                        Cancelar
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -2282,8 +2905,8 @@ function App(): React.JSX.Element {
                         className="text-danger"
                       >
                         <strong>Atención:</strong> Se eliminará la configuración local y el RTSP de
-                        esta cancha. Los partidos históricos y sus videos se conservarán. Los partidos
-                        programados deben cancelarse antes de eliminarla.
+                        esta cancha. Los partidos históricos y sus videos se conservarán. Los
+                        partidos programados deben cancelarse antes de eliminarla.
                       </p>
                     </div>
 
@@ -2313,6 +2936,33 @@ function App(): React.JSX.Element {
           {activeTab === 'config' && (
             <div className="config-view">
               <div className="config-form form-grid">
+                <div
+                  className="card-pane"
+                  style={{
+                    gridColumn: '1 / -1',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    gap: '16px'
+                  }}
+                >
+                  <div>
+                    <h3 className="card-title" style={{ margin: 0 }}>
+                      Versión de la aplicación
+                    </h3>
+                    <p className="text-muted text-sm" style={{ margin: '5px 0 0' }}>
+                      ViewPadel Desktop {appVersion || 'cargando...'}
+                    </p>
+                  </div>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    type="button"
+                    onClick={() => void window.electron?.ipcRenderer.invoke('updater:check')}
+                  >
+                    Buscar actualizaciones
+                  </button>
+                </div>
+
                 {/* Visual Settings & Themes Card */}
                 <div className="card-pane">
                   <h3 className="card-title">Ajustes Visuales</h3>
@@ -2587,42 +3237,23 @@ function App(): React.JSX.Element {
                       Las cámaras se reproducirán en vivo automáticamente en el panel de monitoreo.
                     </span>
                   </div>
-
-                  {/* RTSP configuration input fields for registered courts */}
-                  {courts.length > 0 && (
-                    <div
-                      style={{
-                        marginTop: '24px',
-                        borderTop: '1px solid var(--color-border)',
-                        paddingTop: '16px'
-                      }}
-                    >
-                      <h4 style={{ fontSize: '14px', marginBottom: '10px' }}>
-                        Enlaces de Transmisión RTSP (Cámaras)
-                      </h4>
-                      {courts.map((c) => (
-                        <div key={c.id} className="form-group" style={{ marginBottom: '12px' }}>
-                          <label>{c.name}</label>
-                          <input
-                            type="text"
-                            className="table-input"
-                            value={courtRtspUrls[c.id] || ''}
-                            placeholder="rtsp://usuario:contraseña@ip:puerto/canal"
-                            onChange={(e) =>
-                              setCourtRtspUrls({ ...courtRtspUrls, [c.id]: e.target.value })
-                            }
-                            onBlur={(e) => handleSaveCourtRtsp(c.id, e.target.value)}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  )}
                 </div>
 
                 {/* System Logs Card - Horizontal */}
-                <div className="card-pane" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', gridColumn: '1 / -1' }}>
+                <div
+                  className="card-pane"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '16px 20px',
+                    gridColumn: '1 / -1'
+                  }}
+                >
                   <div>
-                    <h3 className="card-title" style={{ margin: 0, fontSize: '15px' }}>Registros del Sistema</h3>
+                    <h3 className="card-title" style={{ margin: 0, fontSize: '15px' }}>
+                      Registros del Sistema
+                    </h3>
                     <p className="text-muted text-sm" style={{ margin: '4px 0 0 0' }}>
                       Visualiza los logs internos para diagnóstico de errores.
                     </p>
@@ -2746,8 +3377,8 @@ function App(): React.JSX.Element {
                       <h4>Suscripción Gratuita</h4>
                       <h3>Plan FREE</h3>
                       <p>
-                        Estás en el plan gratuito. Las funciones de grabación en la nube y monetización
-                        pueden estar limitadas.
+                        Estás en el plan gratuito. Las funciones de grabación en la nube y
+                        monetización pueden estar limitadas.
                       </p>
                       <button
                         type="button"
@@ -2767,7 +3398,11 @@ function App(): React.JSX.Element {
         {/* Logs Password Modal */}
         {showLogsModal && (
           <div className="modal-overlay" onClick={() => setShowLogsModal(false)}>
-            <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px' }}>
+            <div
+              className="modal-content"
+              onClick={(e) => e.stopPropagation()}
+              style={{ maxWidth: '400px' }}
+            >
               <h3 className="card-title">Acceso a Registros</h3>
               <p className="text-muted text-sm" style={{ marginBottom: '16px' }}>
                 Introduce la contraseña de administrador para ver los logs del sistema.
@@ -2783,8 +3418,20 @@ function App(): React.JSX.Element {
                     autoFocus
                   />
                 </div>
-                <div className="modal-actions" style={{ marginTop: '20px', display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-                  <button type="button" className="btn btn-secondary" onClick={() => setShowLogsModal(false)}>
+                <div
+                  className="modal-actions"
+                  style={{
+                    marginTop: '20px',
+                    display: 'flex',
+                    gap: '8px',
+                    justifyContent: 'flex-end'
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={() => setShowLogsModal(false)}
+                  >
                     Cancelar
                   </button>
                   <button type="submit" className="btn btn-primary">

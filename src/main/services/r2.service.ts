@@ -1,4 +1,10 @@
-import { S3Client, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput, DeleteObjectsCommand } from '@aws-sdk/client-s3'
+import {
+  S3Client,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  ListObjectsV2CommandOutput,
+  DeleteObjectsCommand
+} from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { vaultService } from './vault.service'
@@ -138,13 +144,24 @@ class R2Service {
   public isUploading(matchId: string): boolean {
     return this.activeUploads.has(matchId)
   }
-  public async getSignedVideoUrl(key: string, expiresIn: number = 3600, forDownload: boolean = false): Promise<string> {
+
+  public getActiveCount(): number {
+    return this.activeUploads.size
+  }
+
+  public async getSignedVideoUrl(
+    key: string,
+    expiresIn: number = 3600,
+    forDownload: boolean = false
+  ): Promise<string> {
     try {
       const { client, bucket } = this.getS3Client()
       const command = new GetObjectCommand({
         Bucket: bucket,
         Key: key,
-        ...(forDownload ? { ResponseContentDisposition: `attachment; filename="${key.split('/').pop()}"` } : {})
+        ...(forDownload
+          ? { ResponseContentDisposition: `attachment; filename="${key.split('/').pop()}"` }
+          : {})
       })
       const url = await getSignedUrl(client, command, { expiresIn })
       return url
@@ -167,11 +184,11 @@ class R2Service {
           ContinuationToken: continuationToken
         })
         const response = (await client.send(command)) as ListObjectsV2CommandOutput
-        
+
         if (response.Contents) {
           totalSize += response.Contents.reduce((acc, obj) => acc + (obj.Size || 0), 0)
         }
-        
+
         isTruncated = response.IsTruncated ?? false
         continuationToken = response.NextContinuationToken
       }
@@ -196,7 +213,7 @@ class R2Service {
           ContinuationToken: continuationToken
         })
         const response = (await client.send(command)) as ListObjectsV2CommandOutput
-        
+
         if (response.Contents) {
           for (const obj of response.Contents) {
             if (obj.Key && obj.Key.endsWith('.mp4')) {
@@ -208,11 +225,11 @@ class R2Service {
             }
           }
         }
-        
+
         isTruncated = response.IsTruncated ?? false
         continuationToken = response.NextContinuationToken
       }
-      
+
       // Sort by newest first
       return videos.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime())
     } catch (error) {
@@ -225,7 +242,7 @@ class R2Service {
     try {
       const { client, bucket } = this.getS3Client()
       const cutoffTime = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
-      
+
       let isTruncated = true
       let continuationToken: string | undefined = undefined
       let totalDeleted = 0
@@ -236,11 +253,11 @@ class R2Service {
           ContinuationToken: continuationToken
         })
         const response = (await client.send(command)) as ListObjectsV2CommandOutput
-        
+
         if (response.Contents && response.Contents.length > 0) {
-          const objectsToDelete = response.Contents.filter(obj => 
-            obj.LastModified && new Date(obj.LastModified) < cutoffTime
-          ).map(obj => ({ Key: obj.Key as string }))
+          const objectsToDelete = response.Contents.filter(
+            (obj) => obj.LastModified && new Date(obj.LastModified) < cutoffTime
+          ).map((obj) => ({ Key: obj.Key as string }))
 
           if (objectsToDelete.length > 0) {
             const deleteCommand = new DeleteObjectsCommand({
@@ -254,13 +271,15 @@ class R2Service {
             totalDeleted += objectsToDelete.length
           }
         }
-        
+
         isTruncated = response.IsTruncated ?? false
         continuationToken = response.NextContinuationToken
       }
 
       if (totalDeleted > 0) {
-        console.log(`Deleted ${totalDeleted} old videos from R2 successfully (Retention: ${retentionDays} days).`)
+        console.log(
+          `Deleted ${totalDeleted} old videos from R2 successfully (Retention: ${retentionDays} days).`
+        )
       }
     } catch (error) {
       console.error('Failed to delete old videos:', error)

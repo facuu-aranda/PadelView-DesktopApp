@@ -1,0 +1,15 @@
+logLevel: info
+rtsp: true
+rtspAddress: 127.0.0.1:18554
+rtspTransports: [tcp]
+rtmp: true
+rtmpAddress: 127.0.0.1:11935
+hls: false
+webrtc: false
+srt: false
+moq: false
+api: false
+metrics: false
+paths:
+  all:
+    source: publisher

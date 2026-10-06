@@ -1,0 +1,20 @@
+{
+  "1.5.1": {
+    "title": "Una experiencia más estable",
+    "items": [
+      "Los estados de las grabaciones y las subidas se actualizan automáticamente en pantalla.",
+      "Mayor estabilidad al grabar desde cámaras y grabadores DVR/NVR.",
+      "Puedes detener una grabación manualmente y conservar el video parcial para subirlo.",
+      "Copia de enlaces más confiable para compartir tus videos.",
+      "Nuevas notificaciones visuales para avisarte cuando hay actualizaciones disponibles."
+    ]
+  },
+  "default": {
+    "title": "Novedades de ViewPadel",
+    "items": [
+      "Mejoras de estabilidad y rendimiento.",
+      "Correcciones generales de errores.",
+      "Mejoras en la experiencia de uso."
+    ]
+  }
+}

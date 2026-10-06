@@ -37,11 +37,27 @@ import { localCourtService } from './services/local-court.service'
 import { recorderService } from './services/recorder/recorder.service'
 import { videoSourceResolver } from './services/video-source-resolver.service'
 import { mediaMtxService } from './services/media-mtx.service'
-import type {
-  RecorderChannel,
-  RecorderSource,
-  VideoSource
-} from '../shared/video-source'
+import type { RecorderChannel, RecorderSource, VideoSource } from '../shared/video-source'
+
+type UpdaterEvent = {
+  status:
+    'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error' | 'blocked'
+  version?: string
+  currentVersion?: string
+  percent?: number
+  message?: string
+  activeRecordings?: number
+  activeUploads?: number
+}
+
+let latestUpdaterEvent: UpdaterEvent | null = null
+
+function notifyUpdater(event: UpdaterEvent): void {
+  latestUpdaterEvent = event
+  BrowserWindow.getAllWindows().forEach((win) => {
+    if (!win.isDestroyed()) win.webContents.send('updater:event', event)
+  })
+}
 
 function createWindow(): void {
   // Create the browser window.
@@ -93,21 +109,65 @@ function registerIpcHandlers(): void {
   })
 
   // Set Auth Token and active profile for DB and scheduler services
-  ipcMain.handle(
-    'session:set-token',
-    (_, token: string | null, profileId?: string | null) => {
-      dbService.setAccessToken(token, profileId)
-      if (token === null) {
-        schedulerService.sessionClosed()
-      } else {
-        schedulerService.sessionTokenUpdated(profileId ?? dbService.getProfileId())
-      }
-      return { success: true }
+  ipcMain.handle('session:set-token', (_, token: string | null, profileId?: string | null) => {
+    dbService.setAccessToken(token, profileId)
+    if (token === null) {
+      schedulerService.sessionClosed()
+    } else {
+      schedulerService.sessionTokenUpdated(profileId ?? dbService.getProfileId())
     }
-  )
+    return { success: true }
+  })
 
   ipcMain.handle('session:ready', () => {
     schedulerService.sessionReady()
+    return { success: true }
+  })
+
+  // Application version and updater controls
+  ipcMain.handle('config:get-version', () => app.getVersion())
+  ipcMain.handle('updater:get-state', () => latestUpdaterEvent)
+
+  ipcMain.handle('updater:check', async () => {
+    if (is.dev) {
+      return { success: false, error: 'Las actualizaciones no se comprueban en modo desarrollo.' }
+    }
+
+    try {
+      await autoUpdater.checkForUpdates()
+      return { success: true }
+    } catch (error) {
+      const message = (error as Error).message
+      notifyUpdater({ status: 'error', message })
+      return { success: false, error: message }
+    }
+  })
+
+  ipcMain.handle('updater:download', async () => {
+    try {
+      await autoUpdater.downloadUpdate()
+      return { success: true }
+    } catch (error) {
+      const message = (error as Error).message
+      notifyUpdater({ status: 'error', message })
+      return { success: false, error: message }
+    }
+  })
+
+  ipcMain.handle('updater:install', () => {
+    const activeRecordings = ffmpegService.getActiveCount()
+    const activeUploads = r2Service.getActiveCount()
+    if (activeRecordings > 0 || activeUploads > 0) {
+      notifyUpdater({
+        status: 'blocked',
+        message: 'La actualización espera a que finalicen las grabaciones y subidas activas.',
+        activeRecordings,
+        activeUploads
+      })
+      return { success: false, activeRecordings, activeUploads }
+    }
+
+    autoUpdater.quitAndInstall(false, true)
     return { success: true }
   })
 
@@ -153,20 +213,17 @@ function registerIpcHandlers(): void {
     return vaultService.getSecret(`RTSP_URL_${courtId}`) || ''
   })
 
-  ipcMain.handle(
-    'config:save-rtsp',
-    (_, courtId: string, url: string, profileId: string) => {
-      try {
-        if (!localCourtService.getById(courtId, profileId)) {
-          throw new Error('La cancha local no existe o no pertenece al usuario actual.')
-        }
-        vaultService.setSecret(`RTSP_URL_${courtId}`, url.trim())
-        return { success: true }
-      } catch (error) {
-        return { success: false, error: (error as Error).message }
+  ipcMain.handle('config:save-rtsp', (_, courtId: string, url: string, profileId: string) => {
+    try {
+      if (!localCourtService.getById(courtId, profileId)) {
+        throw new Error('La cancha local no existe o no pertenece al usuario actual.')
       }
+      vaultService.setSecret(`RTSP_URL_${courtId}`, url.trim())
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
     }
-  )
+  })
 
   // Get signed video URL from R2
   ipcMain.handle('config:get-signed-url', async (_, key: string, forDownload?: boolean) => {
@@ -196,7 +253,9 @@ function registerIpcHandlers(): void {
       try {
         const db = dbService.getClient()
         await db.from('matches').delete().eq('video_key', key)
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        /* ignore */
+      }
       return { success: true }
     } catch (error) {
       return { success: false, error: (error as Error).message }
@@ -207,7 +266,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle('config:get-bucket-usage', async () => {
     try {
       const r2UsageBytes = await r2Service.getBucketUsage()
-      
+
       // Calculate local recordings folder size
       let localUsageBytes = 0
       try {
@@ -240,47 +299,41 @@ function registerIpcHandlers(): void {
   })
 
   // 3. Idempotent manual recording start
-  ipcMain.handle(
-    'recordings:start',
-    async (_, input: { courtId: string; profileId: string }) => {
-      try {
-        return {
-          success: true,
-          ...(await schedulerService.startRecordingOnDemand(input.courtId, input.profileId))
-        }
-      } catch (error) {
-        console.error('recordings:start error:', error)
-        return { success: false, error: (error as Error).message }
+  ipcMain.handle('recordings:start', async (_, input: { courtId: string; profileId: string }) => {
+    try {
+      return {
+        success: true,
+        ...(await schedulerService.startRecordingOnDemand(input.courtId, input.profileId))
       }
+    } catch (error) {
+      console.error('recordings:start error:', error)
+      return { success: false, error: (error as Error).message }
     }
-  )
+  })
 
   // 4. Manual action to terminate a recording and persist its real end time
-  ipcMain.handle(
-    'recordings:kill',
-    async (_, input: { matchId: string; profileId: string }) => {
-      const success = ffmpegService.killRecording(input.matchId)
-      if (!success) return { success: false }
+  ipcMain.handle('recordings:kill', async (_, input: { matchId: string; profileId: string }) => {
+    const success = ffmpegService.killRecording(input.matchId)
+    if (!success) return { success: false }
 
-      try {
-        const { error } = await dbService
-          .getClient()
-          .from('matches')
-          .update({ end_time: new Date().toISOString() })
-          .eq('id', input.matchId)
-          .eq('profile_id', input.profileId)
+    try {
+      const { error } = await dbService
+        .getClient()
+        .from('matches')
+        .update({ end_time: new Date().toISOString() })
+        .eq('id', input.matchId)
+        .eq('profile_id', input.profileId)
 
-        if (error) throw error
-        return { success: true }
-      } catch (error) {
-        console.error('recordings:kill end time update error:', error)
-        return {
-          success: false,
-          error: 'La grabación se detuvo, pero no se pudo actualizar su horario final.'
-        }
+      if (error) throw error
+      return { success: true }
+    } catch (error) {
+      console.error('recordings:kill end time update error:', error)
+      return {
+        success: false,
+        error: 'La grabación se detuvo, pero no se pudo actualizar su horario final.'
       }
     }
-  )
+  })
 
   // 4. Manual action to terminate an upload
   ipcMain.handle('uploads:cancel', async (_, matchId: string) => {
@@ -335,7 +388,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'recorders:update',
-    (_, input: { recorderId: string; profileId: string } & Parameters<typeof recorderService.update>[2]) => {
+    (
+      _,
+      input: { recorderId: string; profileId: string } & Parameters<
+        typeof recorderService.update
+      >[2]
+    ) => {
       try {
         const { recorderId, profileId, ...updates } = input
         return { success: true, data: recorderService.update(recorderId, profileId, updates) }
@@ -373,7 +431,13 @@ function registerIpcHandlers(): void {
     'recorders:discover',
     async (
       event,
-      input: { recorderId: string; profileId: string; requestId?: string; maxChannels?: number; timeoutMs?: number }
+      input: {
+        recorderId: string
+        profileId: string
+        requestId?: string
+        maxChannels?: number
+        timeoutMs?: number
+      }
     ) => {
       const requestId = input.requestId || randomUUID()
       const controller = new AbortController()
@@ -445,7 +509,15 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'recorders:test-channel',
-    async (_, input: { recorderId: string; profileId: string; channel: RecorderChannel; stream?: 'main' | 'sub' }) => {
+    async (
+      _,
+      input: {
+        recorderId: string
+        profileId: string
+        channel: RecorderChannel
+        stream?: 'main' | 'sub'
+      }
+    ) => {
       try {
         const valid = await recorderService.testChannel(
           input.recorderId,
@@ -468,7 +540,8 @@ function registerIpcHandlers(): void {
       try {
         recorderService.get(input.recorderId, input.profileId)
         const parsed = new URL(input.url.trim())
-        if (parsed.protocol !== 'rtsp:') throw new Error('La URL manual debe usar el protocolo RTSP.')
+        if (parsed.protocol !== 'rtsp:')
+          throw new Error('La URL manual debe usar el protocolo RTSP.')
         const channelId = `manual:${randomUUID()}`
         const manualRtspKey = `RECORDER_${input.recorderId}_MANUAL_${channelId.replace(':', '_')}`
         vaultService.setSecret(manualRtspKey, input.url.trim())
@@ -507,7 +580,16 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     'courts:create',
-    (_, input: { name: string; rtspUrl?: string; profileId: string; isDvr?: boolean; videoSource?: VideoSource }) => {
+    (
+      _,
+      input: {
+        name: string
+        rtspUrl?: string
+        profileId: string
+        isDvr?: boolean
+        videoSource?: VideoSource
+      }
+    ) => {
       let court: ReturnType<typeof localCourtService.create> | null = null
       try {
         court = localCourtService.create(
@@ -567,41 +649,38 @@ function registerIpcHandlers(): void {
     }
   )
 
-  ipcMain.handle(
-    'courts:delete',
-    async (_, input: { courtId: string; profileId: string }) => {
-      try {
-        if (!localCourtService.getById(input.courtId, input.profileId)) {
-          throw new Error('La cancha local no existe o no pertenece al usuario actual.')
-        }
-
-        const db = dbService.getClient()
-        const { data: activeMatches, error } = await db
-          .from('matches')
-          .select('id, status')
-          .eq('court_id', input.courtId)
-          .in('status', ['SCHEDULED', 'RECORDING'])
-
-        if (error) throw error
-        if (activeMatches && activeMatches.length > 0) {
-          const hasRecording = activeMatches.some((match) => match.status === 'RECORDING')
-          throw new Error(
-            hasRecording
-              ? 'No se puede eliminar una cancha mientras tiene una grabación activa.'
-              : 'No se puede eliminar una cancha con partidos programados. Cancela o reasigna esos partidos primero.'
-          )
-        }
-
-        const deleted = localCourtService.delete(input.courtId, input.profileId)
-        return deleted
-          ? { success: true }
-          : { success: false, error: 'La cancha local no existe o ya fue eliminada.' }
-      } catch (error) {
-        console.error('courts:delete error:', error)
-        return { success: false, error: (error as Error).message }
+  ipcMain.handle('courts:delete', async (_, input: { courtId: string; profileId: string }) => {
+    try {
+      if (!localCourtService.getById(input.courtId, input.profileId)) {
+        throw new Error('La cancha local no existe o no pertenece al usuario actual.')
       }
+
+      const db = dbService.getClient()
+      const { data: activeMatches, error } = await db
+        .from('matches')
+        .select('id, status')
+        .eq('court_id', input.courtId)
+        .in('status', ['SCHEDULED', 'RECORDING'])
+
+      if (error) throw error
+      if (activeMatches && activeMatches.length > 0) {
+        const hasRecording = activeMatches.some((match) => match.status === 'RECORDING')
+        throw new Error(
+          hasRecording
+            ? 'No se puede eliminar una cancha mientras tiene una grabación activa.'
+            : 'No se puede eliminar una cancha con partidos programados. Cancela o reasigna esos partidos primero.'
+        )
+      }
+
+      const deleted = localCourtService.delete(input.courtId, input.profileId)
+      return deleted
+        ? { success: true }
+        : { success: false, error: 'La cancha local no existe o ya fue eliminada.' }
+    } catch (error) {
+      console.error('courts:delete error:', error)
+      return { success: false, error: (error as Error).message }
     }
-  )
+  })
 
   // Read the cloud courts table only once per profile to migrate legacy installations.
   ipcMain.handle('courts:migrate', async (_, profileId: string) => {
@@ -853,7 +932,12 @@ function registerIpcHandlers(): void {
     'video-source:preview-start',
     async (
       _,
-      input: { source: RecorderSource; profileId: string; profile?: 'main' | 'sub'; compatibility?: boolean }
+      input: {
+        source: RecorderSource
+        profileId: string
+        profile?: 'main' | 'sub'
+        compatibility?: boolean
+      }
     ) => {
       try {
         const handle = await mediaMtxService.startPreview(
@@ -906,7 +990,8 @@ function registerIpcHandlers(): void {
             : await videoSourceResolver.resolveVideoSource(courtId, profileId, 'preview')
           rtspUrl = resolved.previewUrl || resolved.recordingUrl
         }
-          if (!rtspUrl) throw new Error('No hay una fuente de video configurada para esta vista previa.')
+        if (!rtspUrl)
+          throw new Error('No hay una fuente de video configurada para esta vista previa.')
         if (cancelledStreamStarts.has(courtId) || (activeStreamRefs.get(courtId) || 0) === 0) {
           startingStreams.delete(courtId)
           cancelledStreamStarts.delete(courtId)
@@ -928,20 +1013,20 @@ function registerIpcHandlers(): void {
           'low_delay',
           '-i',
           rtspUrl,
-        '-f',
-        'mpegts',
-        '-codec:v',
-        'mpeg1video',
-        '-s',
-        '640x360',
-        '-b:v',
-        '800k',
-        '-r',
-        '25',
-        '-bf',
-        '0',
-        '-'
-      ]
+          '-f',
+          'mpegts',
+          '-codec:v',
+          'mpeg1video',
+          '-s',
+          '640x360',
+          '-b:v',
+          '800k',
+          '-r',
+          '25',
+          '-bf',
+          '0',
+          '-'
+        ]
 
         console.log(`[IPC] Spawning FFmpeg stream process for source ${courtId}.`)
         const proc = spawn(ffmpegPath, args)
@@ -952,16 +1037,16 @@ function registerIpcHandlers(): void {
         let chunkCount = 0
 
         proc.stdout.on('data', (data: Buffer) => {
-        chunkCount++
-        if (chunkCount <= 5 || chunkCount % 100 === 0) {
-          console.log(
-            `[IPC] stream for court ${courtId}: sent chunk #${chunkCount} (size: ${data.length} bytes)`
-          )
-        }
-        if (!webContents.isDestroyed()) {
-          webContents.send(`stream:data:${courtId}`, data)
-        }
-      })
+          chunkCount++
+          if (chunkCount <= 5 || chunkCount % 100 === 0) {
+            console.log(
+              `[IPC] stream for court ${courtId}: sent chunk #${chunkCount} (size: ${data.length} bytes)`
+            )
+          }
+          if (!webContents.isDestroyed()) {
+            webContents.send(`stream:data:${courtId}`, data)
+          }
+        })
 
         proc.stderr.on('data', () => {
           // Do not log FFmpeg stderr because it can contain RTSP credentials.
@@ -985,7 +1070,10 @@ function registerIpcHandlers(): void {
       } catch (error) {
         startingStreams.delete(courtId)
         activeStreamRefs.delete(courtId)
-        console.error(`[IPC] Failed to start streaming for source ${courtId}:`, (error as Error).message)
+        console.error(
+          `[IPC] Failed to start streaming for source ${courtId}:`,
+          (error as Error).message
+        )
         return { success: false, error: (error as Error).message }
       }
     }
@@ -1080,26 +1168,46 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 
-  // Configure and check for updates
+  // Configure updater. Downloads and installation are user-controlled so an
+  // active recording or upload is never interrupted by an app quit.
   autoUpdater.autoDownload = false
-  autoUpdater.autoInstallOnAppQuit = true
-  
-  if (is.dev) {
-    // Optionally mock autoUpdater in dev if needed, or disable
-    autoUpdater.logger = console
-  } else {
-    autoUpdater.checkForUpdatesAndNotify()
+  autoUpdater.autoInstallOnAppQuit = false
+  autoUpdater.logger = console
+
+  autoUpdater.on('checking-for-update', () => {
+    notifyUpdater({ status: 'checking', currentVersion: app.getVersion() })
+  })
+
+  autoUpdater.on('update-available', (info) => {
+    notifyUpdater({
+      status: 'available',
+      version: info.version,
+      currentVersion: app.getVersion(),
+      message: typeof info.releaseNotes === 'string' ? info.releaseNotes : undefined
+    })
+  })
+
+  autoUpdater.on('update-not-available', () => {
+    notifyUpdater({ status: 'not-available', currentVersion: app.getVersion() })
+  })
+
+  autoUpdater.on('download-progress', (progress) => {
+    notifyUpdater({ status: 'downloading', percent: progress.percent })
+  })
+
+  autoUpdater.on('update-downloaded', (info) => {
+    notifyUpdater({ status: 'downloaded', version: info.version, currentVersion: app.getVersion() })
+  })
+
+  autoUpdater.on('error', (error) => {
+    notifyUpdater({ status: 'error', message: error.message })
+  })
+
+  if (!is.dev) {
+    autoUpdater.checkForUpdates().catch((error) => {
+      notifyUpdater({ status: 'error', message: (error as Error).message })
+    })
   }
-
-  autoUpdater.on('update-available', () => {
-    console.log('Update available, downloading...')
-    autoUpdater.downloadUpdate()
-  })
-
-  autoUpdater.on('update-downloaded', () => {
-    console.log('Update downloaded, it will be installed on restart')
-    // We could notify the renderer here to show a toast
-  })
 })
 
 const activeStreams = new Map<string, ChildProcess>()
