@@ -9,13 +9,13 @@ files:
   - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
   - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
-asarUnpack:
-  - resources/**
+  - '!resources/bin/**'
 extraResources:
   - from: resources/bin
     to: bin
 win:
   executableName: 'ViewPadel'
+  icon: build/icon.ico
 nsis:
   artifactName: ViewPadel-Setup.${ext}
   shortcutName: ${productName}
@@ -41,6 +41,7 @@ linux:
 appImage:
   artifactName: ${name}-${version}.${ext}
 npmRebuild: false
+compression: normal
 publish:
   provider: github
   owner: facuu-aranda

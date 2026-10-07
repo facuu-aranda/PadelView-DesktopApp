@@ -1,4 +1,11 @@
 {
+  "1.5.3": {
+    "title": "Actualización más confiable",
+    "items": [
+      "Mejoras en la instalación de nuevas versiones.",
+      "La aplicación conserva mejor tus configuraciones al actualizar."
+    ]
+  },
   "1.5.2": {
     "title": "Mejoras visuales",
     "items": [
