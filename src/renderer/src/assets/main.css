@@ -250,9 +250,16 @@
 }
 
 @keyframes pulse-recording {
-  0% { box-shadow: 0 0 10px rgba(16, 185, 129, 0.1); }
-  50% { box-shadow: 0 0 25px rgba(16, 185, 129, 0.35); border-color: var(--color-primary-hover); }
-  100% { box-shadow: 0 0 10px rgba(16, 185, 129, 0.1); }
+  0% {
+    box-shadow: 0 0 10px rgba(16, 185, 129, 0.1);
+  }
+  50% {
+    box-shadow: 0 0 25px rgba(16, 185, 129, 0.35);
+    border-color: var(--color-primary-hover);
+  }
+  100% {
+    box-shadow: 0 0 10px rgba(16, 185, 129, 0.1);
+  }
 }
 
 .court-card-header {
@@ -680,22 +687,30 @@ tr:hover td {
 .toast.success {
   border-left: 4px solid var(--color-primary);
 }
-.toast.success svg { color: var(--color-primary); }
+.toast.success svg {
+  color: var(--color-primary);
+}
 
 .toast.error {
   border-left: 4px solid var(--color-danger);
 }
-.toast.error svg { color: var(--color-danger); }
+.toast.error svg {
+  color: var(--color-danger);
+}
 
 .toast.warning {
   border-left: 4px solid var(--color-warning);
 }
-.toast.warning svg { color: var(--color-warning); }
+.toast.warning svg {
+  color: var(--color-warning);
+}
 
 .toast.info {
   border-left: 4px solid #3b82f6;
 }
-.toast.info svg { color: #3b82f6; }
+.toast.info svg {
+  color: #3b82f6;
+}
 
 /* Utilities */
 .text-primary {
@@ -948,7 +963,8 @@ tr:hover td {
   align-items: center;
   text-align: center;
   gap: 16px;
-  height: fit-content;
+  height: 100%;
+  box-sizing: border-box;
 }
 
 .avatar-wrapper {
@@ -2149,7 +2165,9 @@ body.light-theme .profile-nav-item.active {
 .video-card {
   display: flex;
   flex-direction: column;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  transition:
+    transform 0.2s ease,
+    box-shadow 0.2s ease;
 }
 
 .video-card:hover {
@@ -2183,7 +2201,7 @@ body.light-theme .profile-nav-item.active {
 
 .play-icon {
   color: #fff;
-  filter: drop-shadow(0 2px 8px rgba(0,0,0,0.5));
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.5));
   transform: scale(0.9);
   transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }

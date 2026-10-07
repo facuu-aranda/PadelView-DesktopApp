@@ -1,4 +1,11 @@
 {
+  "1.5.2": {
+    "title": "Mejoras visuales",
+    "items": [
+      "La pantalla de perfil presenta una distribución más equilibrada.",
+      "Pequeñas mejoras visuales y de estabilidad."
+    ]
+  },
   "1.5.1": {
     "title": "Una experiencia más estable",
     "items": [
