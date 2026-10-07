@@ -1,9 +1,23 @@
 {
-  "1.5.3": {
-    "title": "Actualización más confiable",
+  "1.5.4": {
+    "title": "Una experiencia más clara y estable",
     "items": [
-      "Mejoras en la instalación de nuevas versiones.",
-      "La aplicación conserva mejor tus configuraciones al actualizar."
+      "Consulta fácilmente la versión instalada de ViewPadel desde la aplicación.",
+      "Los estados de las grabaciones y las subidas se mantienen más actualizados en pantalla.",
+      "Mayor estabilidad al grabar desde cámaras y grabadores DVR/NVR.",
+      "Puedes detener una grabación manualmente y conservar el video parcial para subirlo.",
+      "Copia enlaces de tus videos de forma más confiable.",
+      "Las actualizaciones muestran avisos más claros y protegen las operaciones activas mientras se preparan."
+    ]
+  },
+  "1.5.3": {
+    "title": "Actualización más clara y confiable",
+    "items": [
+      "Puedes consultar fácilmente la versión instalada de ViewPadel desde la aplicación.",
+      "Las actualizaciones muestran información más clara y te permiten decidir cuándo descargarlas e instalarlas.",
+      "Las grabaciones y subidas activas se protegen mientras se prepara una actualización.",
+      "Instalación más confiable de nuevas versiones en Windows.",
+      "Tu configuración se conserva mejor al actualizar."
     ]
   },
   "1.5.2": {

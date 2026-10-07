@@ -1397,7 +1397,7 @@ function App(): React.JSX.Element {
                 ViewPadel
               </h2>
               <span className="badge" style={{ fontSize: '10px', marginTop: '2px', marginLeft: 0 }}>
-                MVP
+                V{appVersion || '...'}
               </span>
             </div>
           </div>
