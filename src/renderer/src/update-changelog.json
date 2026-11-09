@@ -1,4 +1,13 @@
 {
+  "1.6.0": {
+    "title": "Diagnóstico de soporte mejorado",
+    "items": [
+      "Nuevo modo soporte temporal para diagnosticar problemas.",
+      "Registro estructurado de eventos técnicos.",
+      "Sincronización segura de diagnósticos con el equipo de soporte.",
+      "La sesión de soporte expira automáticamente después de cinco días."
+    ]
+  },
   "1.5.4": {
     "title": "Una experiencia más clara y estable",
     "items": [
