@@ -37,6 +37,7 @@ import { localCourtService } from './services/local-court.service'
 import { recorderService } from './services/recorder/recorder.service'
 import { videoSourceResolver } from './services/video-source-resolver.service'
 import { mediaMtxService } from './services/media-mtx.service'
+import { supportDiagnosticsService } from './services/support-diagnostics.service'
 import type { RecorderChannel, RecorderSource, VideoSource } from '../shared/video-source'
 
 type UpdaterEvent = {
@@ -84,6 +85,15 @@ function createWindow(): void {
     // Keep it clean: extract only the filename from the sourceId URL
     const file = sourceId ? sourceId.split('/').pop() : 'unknown'
     console.log(`[Renderer] [Lvl ${level}] ${message} (${file}:${line})`)
+    supportDiagnosticsService.record({
+      level: level >= 2 ? 'warn' : 'info',
+      event: 'renderer.console.message',
+      component: 'renderer',
+      action: 'console-message',
+      status: 'success',
+      message: `${message} (${file}:${line})`,
+      metadata: { consoleLevel: level }
+    })
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -111,6 +121,15 @@ function registerIpcHandlers(): void {
   // Set Auth Token and active profile for DB and scheduler services
   ipcMain.handle('session:set-token', (_, token: string | null, profileId?: string | null) => {
     dbService.setAccessToken(token, profileId)
+    supportDiagnosticsService.record({
+      level: 'info',
+      event: token ? 'auth.token.updated' : 'auth.session.closed',
+      component: 'auth',
+      action: token ? 'set-token' : 'clear-token',
+      status: 'success',
+      message: token ? 'La sesión autenticada fue actualizada.' : 'La sesión autenticada fue cerrada.',
+      metadata: { profileId: profileId || undefined }
+    })
     if (token === null) {
       schedulerService.sessionClosed()
     } else {
@@ -123,6 +142,17 @@ function registerIpcHandlers(): void {
     schedulerService.sessionReady()
     return { success: true }
   })
+
+  // Support diagnostics. The main process owns the session expiration and queue.
+  ipcMain.handle('support:get-status', () => supportDiagnosticsService.getStatus())
+
+  ipcMain.handle('support:get-queue-status', () => supportDiagnosticsService.getQueueStatus())
+
+  ipcMain.handle('support:activate', (_, code: string) => {
+    return supportDiagnosticsService.activate(code)
+  })
+
+  ipcMain.handle('support:flush', () => supportDiagnosticsService.flush())
 
   // Application version and updater controls
   ipcMain.handle('config:get-version', () => app.getVersion())
@@ -1158,11 +1188,24 @@ app.whenReady().then(() => {
   // Setup IPC
   registerIpcHandlers()
 
+  supportDiagnosticsService.record({
+    level: 'info',
+    event: 'application.started',
+    component: 'main',
+    action: 'startup',
+    status: 'success',
+    message: 'ViewPadel Desktop inició correctamente.',
+    metadata: { version: app.getVersion(), platform: process.platform }
+  })
+
   // Create UI window
   createWindow()
 
   // Start background scheduler service
   schedulerService.start()
+  supportFlushTimer = setInterval(() => {
+    void supportDiagnosticsService.flush()
+  }, 60_000)
 
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -1215,6 +1258,7 @@ const startingStreams = new Set<string>()
 const cancelledStreamStarts = new Set<string>()
 const activeStreamRefs = new Map<string, number>()
 const activeRecorderOperations = new Map<string, AbortController>()
+let supportFlushTimer: NodeJS.Timeout | null = null
 
 app.on('window-all-closed', () => {
   // Kill all live streaming processes
@@ -1230,6 +1274,10 @@ app.on('window-all-closed', () => {
   void mediaMtxService.stop()
 
   if (process.platform !== 'darwin') {
+    if (supportFlushTimer) {
+      clearInterval(supportFlushTimer)
+      supportFlushTimer = null
+    }
     schedulerService.stop()
     app.quit()
   }

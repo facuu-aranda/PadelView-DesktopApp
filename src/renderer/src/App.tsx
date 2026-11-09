@@ -176,6 +176,13 @@ function App(): React.JSX.Element {
   const [launchOnStartup, setLaunchOnStartup] = useState<boolean>(false)
   const [defaultPreviewEnabled, setDefaultPreviewEnabled] = useState<boolean>(true)
   const [courtPreviewEnabled, setCourtPreviewEnabled] = useState<Record<string, boolean>>({})
+  const [supportStatus, setSupportStatus] = useState<{
+    status: 'inactive' | 'active' | 'expired' | 'revoked'
+    session: { expiresAt: string; supportSessionId: string } | null
+    pendingEvents: number
+  }>({ status: 'inactive', session: null, pendingEvents: 0 })
+  const [supportCode, setSupportCode] = useState('')
+  const [supportBusy, setSupportBusy] = useState(false)
 
   // Profile States
   const [profileName, setProfileName] = useState<string>('Operador Sportivo')
@@ -244,6 +251,46 @@ function App(): React.JSX.Element {
   const showToast = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
     setToast({ message, type })
     setTimeout(() => setToast(null), 4000)
+  }
+
+  const loadSupportStatus = async () => {
+    if (!window.electron) return
+    const status = await window.electron.ipcRenderer.invoke('support:get-status')
+    setSupportStatus(status)
+  }
+
+  const handleActivateSupport = async () => {
+    if (!supportCode.trim() || !window.electron) return
+    setSupportBusy(true)
+    try {
+      const result = await window.electron.ipcRenderer.invoke('support:activate', supportCode)
+      if (!result.success) {
+        showToast(result.error || 'No se pudo activar el modo soporte.', 'error')
+        return
+      }
+      setSupportCode('')
+      await loadSupportStatus()
+      showToast('Modo soporte activado por cinco días.', 'success')
+    } finally {
+      setSupportBusy(false)
+    }
+  }
+
+  const handleFlushSupport = async () => {
+    if (!window.electron) return
+    setSupportBusy(true)
+    try {
+      const result = await window.electron.ipcRenderer.invoke('support:flush')
+      await loadSupportStatus()
+      showToast(
+        result.success
+          ? `${result.uploaded} eventos sincronizados.`
+          : `No se pudieron sincronizar los eventos: ${result.error || 'error desconocido'}`,
+        result.success ? 'success' : 'warning'
+      )
+    } finally {
+      setSupportBusy(false)
+    }
   }
 
   const copyTextToClipboard = async (value: string, successMessage: string): Promise<boolean> => {
@@ -637,6 +684,7 @@ function App(): React.JSX.Element {
       if (window.electron) {
         const notifyEnabled = await window.electron.ipcRenderer.invoke('config:get-notifications')
         setNotificationsEnabled(notifyEnabled)
+        await loadSupportStatus()
       }
 
       // (Profile settings are now fetched on login from DB)
@@ -3237,6 +3285,67 @@ function App(): React.JSX.Element {
                       Las cámaras se reproducirán en vivo automáticamente en el panel de monitoreo.
                     </span>
                   </div>
+                </div>
+
+                {/* Support diagnostics */}
+                <div className="card-pane" style={{ gridColumn: '1 / -1' }}>
+                  <h3 className="card-title">Modo Soporte</h3>
+                  <p className="text-muted text-sm" style={{ marginTop: 0 }}>
+                    Activa el diagnóstico temporal únicamente cuando el equipo de soporte te lo
+                    indique. La sesión vence automáticamente a los cinco días.
+                  </p>
+
+                  {supportStatus.status === 'active' && supportStatus.session ? (
+                    <div
+                      style={{
+                        padding: '12px',
+                        borderRadius: '8px',
+                        border: '1px solid rgba(34, 197, 94, 0.35)',
+                        background: 'rgba(34, 197, 94, 0.08)'
+                      }}
+                    >
+                      <strong>Modo soporte activo</strong>
+                      <div className="input-hint" style={{ marginTop: '6px' }}>
+                        Vence el {new Date(supportStatus.session.expiresAt).toLocaleString()}.
+                        Eventos pendientes: {supportStatus.pendingEvents}.
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        style={{ marginTop: '12px' }}
+                        onClick={handleFlushSupport}
+                        disabled={supportBusy || supportStatus.pendingEvents === 0}
+                      >
+                        Sincronizar eventos
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="form-group" style={{ marginBottom: '10px' }}>
+                        <label>Código entregado por soporte</label>
+                        <input
+                          type="text"
+                          value={supportCode}
+                          onChange={(event) => setSupportCode(event.target.value.toUpperCase())}
+                          placeholder="VP-XXXXXXXXXXXX"
+                          autoComplete="off"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        onClick={handleActivateSupport}
+                        disabled={supportBusy || !supportCode.trim()}
+                      >
+                        Activar modo soporte
+                      </button>
+                      {supportStatus.status !== 'inactive' && (
+                        <span className="input-hint" style={{ marginLeft: '12px' }}>
+                          Sesión {supportStatus.status}.
+                        </span>
+                      )}
+                    </>
+                  )}
                 </div>
 
                 {/* System Logs Card - Horizontal */}
