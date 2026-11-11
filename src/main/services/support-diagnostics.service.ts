@@ -63,6 +63,10 @@ function sanitizeValue(value: unknown, key = ''): unknown {
     return value
       .replace(/bearer\s+[^\s]+/gi, 'Bearer [REDACTED]')
       .replace(/(rtsp:\/\/)([^@\s]+)@/gi, '$1[REDACTED]@')
+      .replace(
+        /([?&](?:access_token|refresh_token|provider_token|id_token|code)=)[^&#\s]+/gi,
+        '$1[REDACTED]'
+      )
   }
 
   if (Array.isArray(value)) return value.map((item) => sanitizeValue(item, key))
@@ -203,7 +207,7 @@ class SupportDiagnosticsService {
       component: input.component,
       action: input.action,
       status: input.status,
-      message: input.message,
+      message: sanitizeValue(input.message) as string,
       appVersion: app.getVersion(),
       platform: process.platform,
       installationId: session.installationId,

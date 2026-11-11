@@ -1,4 +1,13 @@
 {
+  "1.6.1": {
+    "title": "Diagnóstico detallado de grabaciones",
+    "items": [
+      "Se registran las etapas completas de una grabación, desde la fuente de video hasta la subida.",
+      "Los errores de FFmpeg incluyen código de salida, señal, duración, tamaño del archivo y stderr sanitizado.",
+      "Se capturan errores de scheduler, cámaras, R2, IPC y promesas no controladas.",
+      "Los deep links de autenticación ya no se escriben en los logs."
+    ]
+  },
   "1.6.0": {
     "title": "Diagnóstico de soporte mejorado",
     "items": [

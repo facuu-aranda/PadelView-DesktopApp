@@ -9,6 +9,7 @@ import { vaultService } from './vault.service'
 import { localCourtService } from './local-court.service'
 import { videoSourceResolver } from './video-source-resolver.service'
 import { mediaMtxService } from './media-mtx.service'
+import { supportDiagnosticsService } from './support-diagnostics.service'
 
 export interface Match {
   id: string
@@ -119,6 +120,24 @@ class SchedulerService {
   private async markMatchFailed(match: Match, reason: string): Promise<void> {
     const message = `${this.matchContext(match)}: ${reason}`
     console.error(message)
+    supportDiagnosticsService.record({
+      level: 'error',
+      event: 'recording.failed',
+      component: 'scheduler',
+      action: 'recording-lifecycle',
+      status: 'failed',
+      message,
+      metadata: {
+        matchId: match.id,
+        courtId: match.court_id,
+        courtName: match.court_name,
+        profileId: match.profile_id,
+        scheduledStart: match.start_time,
+        scheduledEnd: match.end_time,
+        currentStatus: match.status,
+        reason
+      }
+    })
     const { error } = await dbService
       .getClient()
       .from('matches')
@@ -345,6 +364,27 @@ class SchedulerService {
       return
     }
 
+    supportDiagnosticsService.record({
+      level: 'info',
+      event: 'recording.start_requested',
+      component: 'scheduler',
+      action: 'recording-lifecycle',
+      status: 'started',
+      message: `La grabación está por comenzar para ${this.matchContext(match)}.`,
+      metadata: {
+        matchId: match.id,
+        courtId: match.court_id,
+        courtName: court.name,
+        profileId,
+        scheduledStart: match.start_time,
+        scheduledEnd: match.end_time,
+        startedAt: now.toISOString(),
+        durationSeconds,
+        sourceType: court.video_source.type,
+        statusAlreadySet
+      }
+    })
+
     let rtspUrl: string
     let releaseVideoSource: (() => Promise<void>) | undefined
     try {
@@ -369,8 +409,37 @@ class SchedulerService {
         )
         rtspUrl = resolvedSource.recordingUrl
       }
+      supportDiagnosticsService.record({
+        level: 'info',
+        event: 'recording.source.resolved',
+        component: 'scheduler',
+        action: 'resolve-video-source',
+        status: 'success',
+        message: `La fuente de video fue resuelta para ${this.matchContext(match)}.`,
+        metadata: {
+          matchId: match.id,
+          courtId: match.court_id,
+          sourceType: court.video_source.type,
+          recorderId:
+            court.video_source.type === 'recorder' ? court.video_source.recorderId : undefined
+        }
+      })
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
+      supportDiagnosticsService.record({
+        level: 'error',
+        event: 'recording.source.resolve_failed',
+        component: 'scheduler',
+        action: 'resolve-video-source',
+        status: 'failed',
+        message: `No se pudo resolver la fuente de video para ${this.matchContext(match)}.`,
+        metadata: {
+          matchId: match.id,
+          courtId: match.court_id,
+          sourceType: court.video_source.type
+        },
+        error
+      })
       await this.markMatchFailed(match, `video source resolution failed: ${detail}`)
       return
     }
@@ -427,6 +496,23 @@ class SchedulerService {
           console.log(
             `Recording ${completion.manualStop ? 'manually stopped' : 'complete'} for ${this.matchContext(match)}. Local file: ${savedPath}`
           )
+          supportDiagnosticsService.record({
+            level: 'info',
+            event: completion.manualStop ? 'recording.partial.ready' : 'recording.file.ready',
+            component: 'scheduler',
+            action: 'recording-lifecycle',
+            status: 'success',
+            message: `El archivo local de ${this.matchContext(match)} está listo para subir.`,
+            durationMs: elapsedSeconds * 1000,
+            metadata: {
+              matchId: match.id,
+              savedPath,
+              elapsedSeconds,
+              durationSeconds,
+              manualStop: completion.manualStop,
+              partial: completion.partial
+            }
+          })
           await releaseVideoSource?.()
           this.showNotification(
             completion.manualStop ? 'Grabación Parcial Lista' : 'Grabación Finalizada',
@@ -439,6 +525,22 @@ class SchedulerService {
         onError: async (err) => {
           const detail = err instanceof Error ? err.message : String(err)
           console.error(`Recording error for ${this.matchContext(match)}:`, detail)
+          supportDiagnosticsService.record({
+            level: 'error',
+            event: 'recording.failed',
+            component: 'scheduler',
+            action: 'recording-lifecycle',
+            status: 'failed',
+            message: `Falló la grabación de ${this.matchContext(match)}.`,
+            metadata: {
+              matchId: match.id,
+              courtId: match.court_id,
+              durationSeconds,
+              elapsedSeconds: Math.floor((Date.now() - recordingStartedAt) / 1000),
+              sourceType: court.video_source.type
+            },
+            error: err
+          })
           await releaseVideoSource?.()
           this.showNotification(
             'Error de Grabación',
@@ -479,6 +581,21 @@ class SchedulerService {
       const dateStr = new Date(match.start_time).toISOString().split('T')[0]
       const destinationKey = `videos/court_${match.court_id}/${dateStr}_${match.id}.mp4`
 
+      supportDiagnosticsService.record({
+        level: 'info',
+        event: 'recording.upload.started',
+        component: 'r2',
+        action: 'upload-video',
+        status: 'started',
+        message: `Comenzó la subida del video de ${this.matchContext(match)}.`,
+        metadata: {
+          matchId: match.id,
+          filePath,
+          destinationKey,
+          fileSize: fs.statSync(filePath).size
+        }
+      })
+
       // 2. Perform R2 Multipart upload
       await r2Service.uploadVideo({
         matchId: match.id,
@@ -501,6 +618,19 @@ class SchedulerService {
           error_log: null
         })
         .eq('id', match.id)
+      supportDiagnosticsService.record({
+        level: 'info',
+        event: 'recording.upload.completed',
+        component: 'r2',
+        action: 'upload-video',
+        status: 'success',
+        message: `La subida del video de ${this.matchContext(match)} finalizó correctamente.`,
+        metadata: {
+          matchId: match.id,
+          destinationKey,
+          filePath
+        }
+      })
       this.notifyUI('match-updated', match.id)
       this.showNotification(
         'Video Listo',
@@ -516,6 +646,21 @@ class SchedulerService {
       const detail = err instanceof Error ? err.message : String(err)
       const message = `${this.matchContext(match)}: upload failed: ${detail}`
       console.error(message)
+      supportDiagnosticsService.record({
+        level: 'error',
+        event: 'recording.upload.failed',
+        component: 'r2',
+        action: 'upload-video',
+        status: 'failed',
+        message,
+        metadata: {
+          matchId: match.id,
+          filePath,
+          scheduledStart: match.start_time,
+          scheduledEnd: match.end_time
+        },
+        error: err
+      })
       this.showNotification(
         'Error de Subida',
         `No se pudo subir el video de ${match.player_name} a la nube.`

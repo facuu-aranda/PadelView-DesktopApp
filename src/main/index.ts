@@ -40,6 +40,54 @@ import { mediaMtxService } from './services/media-mtx.service'
 import { supportDiagnosticsService } from './services/support-diagnostics.service'
 import type { RecorderChannel, RecorderSource, VideoSource } from '../shared/video-source'
 
+const originalConsoleError = console.error.bind(console)
+const originalConsoleWarn = console.warn.bind(console)
+
+function captureRuntimeLog(level: 'error' | 'warn', args: unknown[]): void {
+  const error = args.find((value) => value instanceof Error)
+  const message = args
+    .map((value) => (value instanceof Error ? value.message : String(value)))
+    .join(' ')
+
+  supportDiagnosticsService.record({
+    level,
+    event: level === 'error' ? 'runtime.error' : 'runtime.warning',
+    component: 'main',
+    action: 'console',
+    status: level === 'error' ? 'failed' : 'success',
+    message,
+    error
+  })
+}
+
+console.error = (...args: unknown[]) => {
+  originalConsoleError(...args)
+  captureRuntimeLog('error', args)
+}
+
+console.warn = (...args: unknown[]) => {
+  originalConsoleWarn(...args)
+  captureRuntimeLog('warn', args)
+}
+
+let fatalProcessErrorHandled = false
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error)
+  if (fatalProcessErrorHandled) return
+  fatalProcessErrorHandled = true
+  process.exitCode = 1
+  setImmediate(() => process.exit(1))
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason)
+  if (fatalProcessErrorHandled) return
+  fatalProcessErrorHandled = true
+  process.exitCode = 1
+  setImmediate(() => process.exit(1))
+})
+
 type UpdaterEvent = {
   status:
     'checking' | 'available' | 'not-available' | 'downloading' | 'downloaded' | 'error' | 'blocked'
@@ -86,11 +134,11 @@ function createWindow(): void {
     const file = sourceId ? sourceId.split('/').pop() : 'unknown'
     console.log(`[Renderer] [Lvl ${level}] ${message} (${file}:${line})`)
     supportDiagnosticsService.record({
-      level: level >= 2 ? 'warn' : 'info',
-      event: 'renderer.console.message',
+      level: level >= 2 ? 'error' : level === 1 ? 'warn' : 'info',
+      event: level >= 2 ? 'renderer.error' : 'renderer.console.message',
       component: 'renderer',
       action: 'console-message',
-      status: 'success',
+      status: level >= 2 ? 'failed' : 'success',
       message: `${message} (${file}:${line})`,
       metadata: { consoleLevel: level }
     })

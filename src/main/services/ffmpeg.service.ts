@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { spawn, ChildProcess } from 'child_process'
 import path from 'path'
 import fs from 'fs'
+import { supportDiagnosticsService } from './support-diagnostics.service'
 
 export interface RecordingProgress {
   matchId: string
@@ -90,6 +91,23 @@ class FFmpegService {
     }
 
     const ffmpegPath = this.getFFmpegPath()
+    const recordingStartedAt = new Date().toISOString()
+    supportDiagnosticsService.record({
+      level: 'info',
+      event: 'recording.ffmpeg.started',
+      component: 'ffmpeg',
+      action: 'record',
+      status: 'started',
+      message: `FFmpeg inició la grabación ${matchId}.`,
+      metadata: {
+        matchId,
+        ffmpegPath,
+        durationSeconds,
+        includeAudio,
+        outputFilePath,
+        startedAt: recordingStartedAt
+      }
+    })
     console.log(`Starting FFmpeg recording using: ${ffmpegPath}`)
     console.log('Starting recording from the configured local RTSP source.')
     console.log(`Output: ${outputFilePath}`)
@@ -161,6 +179,16 @@ class FFmpegService {
         }
         const stderr = this.redactRtspUrls(errorLog).trim()
         if (stderr) customErr.message += `\nFFmpeg stderr:\n${stderr}`
+        supportDiagnosticsService.record({
+          level: 'error',
+          event: 'recording.ffmpeg.process_error',
+          component: 'ffmpeg',
+          action: 'record',
+          status: 'failed',
+          message: `FFmpeg no pudo iniciar o se cerró con un error para ${matchId}.`,
+          metadata: { matchId, ffmpegPath, durationSeconds, outputFilePath },
+          error: customErr
+        })
         onError?.(customErr)
       })
 
@@ -182,6 +210,25 @@ class FFmpegService {
         this.cleanup(matchId)
 
         if (code === 0 && outputSize > 0 && reachedExpectedDuration) {
+          supportDiagnosticsService.record({
+            level: 'info',
+            event: 'recording.ffmpeg.completed',
+            component: 'ffmpeg',
+            action: 'record',
+            status: 'success',
+            message: `FFmpeg completó la grabación ${matchId}.`,
+            durationMs: elapsedSeconds * 1000,
+            metadata: {
+              matchId,
+              exitCode: code,
+              signal,
+              elapsedSeconds,
+              durationSeconds,
+              outputSize,
+              outputExists,
+              outputFilePath
+            }
+          })
           onComplete?.(outputFilePath, {
             elapsedSeconds,
             durationSeconds,
@@ -195,6 +242,24 @@ class FFmpegService {
         // intentionally explicit; code === null alone never means completion.
         if (manualStopRequested && outputSize > 1024 * 1024 && (code === 0 || code === null)) {
           console.log(`Recording for match ${matchId} stopped manually; saving partial file.`)
+          supportDiagnosticsService.record({
+            level: 'info',
+            event: 'recording.ffmpeg.partial',
+            component: 'ffmpeg',
+            action: 'record',
+            status: 'success',
+            message: `FFmpeg guardó una grabación parcial solicitada manualmente para ${matchId}.`,
+            durationMs: elapsedSeconds * 1000,
+            metadata: {
+              matchId,
+              exitCode: code,
+              signal,
+              elapsedSeconds,
+              durationSeconds,
+              outputSize,
+              outputFilePath
+            }
+          })
           onComplete?.(outputFilePath, {
             elapsedSeconds,
             durationSeconds,
@@ -210,10 +275,44 @@ class FFmpegService {
             ? `terminated prematurely after ${elapsedSeconds}s (expected ${durationSeconds}s)`
             : `terminated with ${status} after ${elapsedSeconds}s`
         const details = stderr ? `\nFFmpeg stderr:\n${stderr}` : '\nFFmpeg stderr: (empty)'
-        onError?.(new Error(`FFmpeg recording ${reason}.${details}`))
+        const recordingError = new Error(`FFmpeg recording ${reason}.${details}`)
+        supportDiagnosticsService.record({
+          level: 'error',
+          event: 'recording.ffmpeg.failed',
+          component: 'ffmpeg',
+          action: 'record',
+          status: 'failed',
+          message: `FFmpeg falló durante la grabación ${matchId}: ${reason}.`,
+          durationMs: elapsedSeconds * 1000,
+          metadata: {
+            matchId,
+            exitCode: code,
+            signal,
+            elapsedSeconds,
+            durationSeconds,
+            outputSize,
+            outputExists,
+            reachedExpectedDuration,
+            manualStopRequested,
+            outputFilePath,
+            stderrTail: stderr || null
+          },
+          error: recordingError
+        })
+        onError?.(recordingError)
       })
     } catch (err) {
       console.error(`Error spawning FFmpeg:`, err)
+      supportDiagnosticsService.record({
+        level: 'error',
+        event: 'recording.ffmpeg.spawn_failed',
+        component: 'ffmpeg',
+        action: 'spawn',
+        status: 'failed',
+        message: `No se pudo iniciar FFmpeg para la grabación ${matchId}.`,
+        metadata: { matchId, ffmpegPath, durationSeconds, outputFilePath },
+        error: err
+      })
       this.cleanup(matchId)
       onError?.(err as Error)
     }
@@ -226,6 +325,15 @@ class FFmpegService {
     const child = this.activeProcesses.get(matchId)
     if (child) {
       console.log(`Stopping active recording cleanly via stdin for match: ${matchId}`)
+      supportDiagnosticsService.record({
+        level: 'info',
+        event: 'recording.ffmpeg.stop_requested',
+        component: 'ffmpeg',
+        action: 'stop',
+        status: 'started',
+        message: `Se solicitó detener manualmente FFmpeg para ${matchId}.`,
+        metadata: { matchId }
+      })
       this.manualStopRequests.add(matchId)
       try {
         if (child.stdin && child.stdin.writable) {

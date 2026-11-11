@@ -13,7 +13,8 @@ export default function LoginScreen({ onLogin }: LoginScreenProps) {
   useEffect(() => {
     // Listen for deep link IPC event
     const handleDeepLink = async (_event: any, url: string) => {
-      console.log('Received deep link:', url)
+      // Never log the deep link: it contains OAuth access and refresh tokens.
+      console.log('Received authentication deep link.')
       setLoading(true)
       try {
         const urlObj = new URL(url)
