@@ -1,4 +1,13 @@
 {
+  "1.6.2": {
+    "title": "Diagnóstico más preciso de grabaciones",
+    "items": [
+      "Se registra el ciclo completo de cada grabación, desde su planificación hasta la subida del video.",
+      "Las grabaciones activas informan periódicamente su estado sin generar registros innecesarios.",
+      "Los problemas de cámara, FFmpeg, archivos locales y subidas muestran información más útil para soporte.",
+      "Las grabaciones simultáneas se identifican por separado para facilitar el seguimiento de cada cancha."
+    ]
+  },
   "1.6.1": {
     "title": "Diagnóstico detallado de grabaciones",
     "items": [

@@ -586,6 +586,49 @@ canales permitidos y extractores seguros.
 
 No registrar rutas completas si contienen informacion sensible innecesaria.
 
+### 8.1. Contrato minimo del ciclo de una grabacion
+
+Cada grabacion debe tener un `correlationId` propio y emitir, como minimo, esta
+secuencia:
+
+```text
+recording.scheduled
+recording.start_requested
+recording.source.resolved
+recording.started
+recording.ffmpeg.started
+recording.heartbeat              cada cinco minutos mientras siga activa
+recording.ffmpeg.completed       o recording.ffmpeg.failed
+recording.file.ready             o recording.failed
+recording.upload.started
+recording.upload.completed       o recording.upload.failed
+```
+
+Los eventos de error deben identificar:
+
+- `matchId`;
+- `courtId` y nombre de cancha;
+- perfil;
+- fuente utilizada;
+- inicio y fin planificados;
+- duración esperada;
+- duración real;
+- cantidad de grabaciones simultaneas;
+- codigo de salida del proceso;
+- señal de terminacion;
+- tamaño y existencia del archivo;
+- cola o etapa en la que ocurrió el fallo;
+- cola de stderr de FFmpeg, sanitizada.
+
+No registrar cada segundo. El estado de una grabacion activa se informa con un
+heartbeat cada cinco minutos y los cambios importantes se informan
+inmediatamente. Si hay varias grabaciones simultaneas, cada una conserva su
+`correlationId` y sus propios heartbeats; `activeRecordingCount` permite
+reconstruir el estado global.
+
+El heartbeat debe detenerse siempre al finalizar, fallar, cancelar o limpiar la
+grabacion. Nunca debe quedar un temporizador asociado a una grabacion terminal.
+
 ### Camaras, streams y procesos
 
 - descubrimiento;

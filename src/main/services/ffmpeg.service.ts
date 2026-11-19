@@ -19,6 +19,7 @@ export interface RecordingCompletion {
 
 export interface RecordingOptions {
   matchId: string
+  correlationId?: string
   rtspUrl: string
   durationSeconds: number
   outputFilePath: string
@@ -30,6 +31,7 @@ export interface RecordingOptions {
 
 class FFmpegService {
   private activeProcesses: Map<string, ChildProcess> = new Map()
+  private recordingCorrelations: Map<string, string | undefined> = new Map()
   private progressIntervals: Map<string, NodeJS.Timeout> = new Map()
   private manualStopRequests: Set<string> = new Set()
 
@@ -70,6 +72,7 @@ class FFmpegService {
   public startRecording(options: RecordingOptions): void {
     const {
       matchId,
+      correlationId,
       rtspUrl,
       durationSeconds,
       outputFilePath,
@@ -91,23 +94,6 @@ class FFmpegService {
     }
 
     const ffmpegPath = this.getFFmpegPath()
-    const recordingStartedAt = new Date().toISOString()
-    supportDiagnosticsService.record({
-      level: 'info',
-      event: 'recording.ffmpeg.started',
-      component: 'ffmpeg',
-      action: 'record',
-      status: 'started',
-      message: `FFmpeg inició la grabación ${matchId}.`,
-      metadata: {
-        matchId,
-        ffmpegPath,
-        durationSeconds,
-        includeAudio,
-        outputFilePath,
-        startedAt: recordingStartedAt
-      }
-    })
     console.log(`Starting FFmpeg recording using: ${ffmpegPath}`)
     console.log('Starting recording from the configured local RTSP source.')
     console.log(`Output: ${outputFilePath}`)
@@ -140,6 +126,24 @@ class FFmpegService {
     try {
       const child = spawn(ffmpegPath, args)
       this.activeProcesses.set(matchId, child)
+      this.recordingCorrelations.set(matchId, correlationId)
+      supportDiagnosticsService.record({
+        level: 'info',
+        event: 'recording.ffmpeg.started',
+        component: 'ffmpeg',
+        action: 'record',
+        status: 'started',
+        correlationId,
+        message: `FFmpeg inició la grabación ${matchId}.`,
+        metadata: {
+          matchId,
+          ffmpegPath,
+          durationSeconds,
+          includeAudio,
+          outputFilePath,
+          startedAt: new Date().toISOString()
+        }
+      })
 
       let errorLog = ''
       let handled = false
@@ -185,6 +189,7 @@ class FFmpegService {
           component: 'ffmpeg',
           action: 'record',
           status: 'failed',
+          correlationId,
           message: `FFmpeg no pudo iniciar o se cerró con un error para ${matchId}.`,
           metadata: { matchId, ffmpegPath, durationSeconds, outputFilePath },
           error: customErr
@@ -216,6 +221,7 @@ class FFmpegService {
             component: 'ffmpeg',
             action: 'record',
             status: 'success',
+            correlationId,
             message: `FFmpeg completó la grabación ${matchId}.`,
             durationMs: elapsedSeconds * 1000,
             metadata: {
@@ -248,6 +254,7 @@ class FFmpegService {
             component: 'ffmpeg',
             action: 'record',
             status: 'success',
+            correlationId,
             message: `FFmpeg guardó una grabación parcial solicitada manualmente para ${matchId}.`,
             durationMs: elapsedSeconds * 1000,
             metadata: {
@@ -282,6 +289,7 @@ class FFmpegService {
           component: 'ffmpeg',
           action: 'record',
           status: 'failed',
+          correlationId,
           message: `FFmpeg falló durante la grabación ${matchId}: ${reason}.`,
           durationMs: elapsedSeconds * 1000,
           metadata: {
@@ -309,6 +317,7 @@ class FFmpegService {
         component: 'ffmpeg',
         action: 'spawn',
         status: 'failed',
+        correlationId,
         message: `No se pudo iniciar FFmpeg para la grabación ${matchId}.`,
         metadata: { matchId, ffmpegPath, durationSeconds, outputFilePath },
         error: err
@@ -331,6 +340,7 @@ class FFmpegService {
         component: 'ffmpeg',
         action: 'stop',
         status: 'started',
+        correlationId: this.recordingCorrelations.get(matchId),
         message: `Se solicitó detener manualmente FFmpeg para ${matchId}.`,
         metadata: { matchId }
       })
@@ -377,6 +387,7 @@ class FFmpegService {
    */
   private cleanup(matchId: string): void {
     this.activeProcesses.delete(matchId)
+    this.recordingCorrelations.delete(matchId)
     this.manualStopRequests.delete(matchId)
 
     const interval = this.progressIntervals.get(matchId)

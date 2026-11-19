@@ -1,4 +1,5 @@
 import { app, BrowserWindow, Notification } from 'electron'
+import { randomUUID } from 'crypto'
 import icon from '../../../resources/icon.png?asset'
 import path from 'path'
 import fs from 'fs'
@@ -33,6 +34,8 @@ class SchedulerService {
   private tempDir: string
   private lastCleanupTime: number = 0
   private onDemandStarts = new Map<string, Promise<{ match: Match; alreadyActive: boolean }>>()
+  private scheduledCorrelations = new Map<string, string>()
+  private recordingHeartbeats = new Map<string, NodeJS.Timeout>()
 
   constructor() {
     this.tempDir = path.join(app.getPath('userData'), 'temp_recordings')
@@ -70,6 +73,9 @@ class SchedulerService {
       clearInterval(this.timer)
       this.timer = null
       console.log('Scheduler Service stopped.')
+    }
+    for (const matchId of this.recordingHeartbeats.keys()) {
+      this.stopRecordingHeartbeat(matchId)
     }
   }
 
@@ -117,7 +123,11 @@ class SchedulerService {
     return { startTime, endTime, durationMs }
   }
 
-  private async markMatchFailed(match: Match, reason: string): Promise<void> {
+  private async markMatchFailed(
+    match: Match,
+    reason: string,
+    correlationId?: string
+  ): Promise<void> {
     const message = `${this.matchContext(match)}: ${reason}`
     console.error(message)
     supportDiagnosticsService.record({
@@ -126,6 +136,7 @@ class SchedulerService {
       component: 'scheduler',
       action: 'recording-lifecycle',
       status: 'failed',
+      correlationId,
       message,
       metadata: {
         matchId: match.id,
@@ -145,7 +156,55 @@ class SchedulerService {
       .eq('id', match.id)
 
     if (error) console.error(`Could not mark ${this.matchContext(match)} as FAILED:`, error)
+    this.stopRecordingHeartbeat(match.id)
+    this.scheduledCorrelations.delete(match.id)
     this.notifyUI('match-updated', match.id)
+  }
+
+  private stopRecordingHeartbeat(matchId: string): void {
+    const timer = this.recordingHeartbeats.get(matchId)
+    if (timer) clearInterval(timer)
+    this.recordingHeartbeats.delete(matchId)
+  }
+
+  private startRecordingHeartbeat(
+    match: Match,
+    correlationId: string,
+    startedAt: number,
+    durationSeconds: number,
+    endTime: Date
+  ): void {
+    this.stopRecordingHeartbeat(match.id)
+    const emit = (): void => {
+      if (!ffmpegService.isRecording(match.id)) {
+        this.stopRecordingHeartbeat(match.id)
+        return
+      }
+
+      const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000)
+      supportDiagnosticsService.record({
+        level: 'info',
+        event: 'recording.heartbeat',
+        component: 'scheduler',
+        action: 'recording-progress',
+        status: 'success',
+        correlationId,
+        message: `La grabación continúa activa: ${this.matchContext(match)}.`,
+        metadata: {
+          matchId: match.id,
+          courtId: match.court_id,
+          courtName: match.court_name,
+          elapsedSeconds,
+          expectedDurationSeconds: durationSeconds,
+          remainingSeconds: Math.max(Math.floor((endTime.getTime() - Date.now()) / 1000), 0),
+          activeRecordingCount: ffmpegService.getActiveCount()
+        }
+      })
+    }
+
+    // The initial lifecycle event is immediate; heartbeats are intentionally sparse.
+    emit()
+    this.recordingHeartbeats.set(match.id, setInterval(emit, 5 * 60 * 1000))
   }
 
   /**
@@ -188,11 +247,34 @@ class SchedulerService {
       }
 
       for (const match of matches as Match[]) {
+        let correlationId = this.scheduledCorrelations.get(match.id)
+        if (!correlationId) {
+          correlationId = randomUUID()
+          this.scheduledCorrelations.set(match.id, correlationId)
+          supportDiagnosticsService.record({
+            level: 'info',
+            event: 'recording.scheduled',
+            component: 'scheduler',
+            action: 'recording-lifecycle',
+            status: 'success',
+            correlationId,
+            message: `Grabación planificada detectada: ${this.matchContext(match)}.`,
+            metadata: {
+              matchId: match.id,
+              courtId: match.court_id,
+              courtName: match.court_name,
+              scheduledStart: match.start_time,
+              scheduledEnd: match.end_time,
+              activeRecordingCount: ffmpegService.getActiveCount()
+            }
+          })
+        }
         const window = this.getMatchWindow(match)
         if (!window) {
           await this.markMatchFailed(
             match,
-            `invalid recording window: start_time and end_time must be valid and end_time must be after start_time (received start=${match.start_time}, end=${match.end_time})`
+            `invalid recording window: start_time and end_time must be valid and end_time must be after start_time (received start=${match.start_time}, end=${match.end_time})`,
+            correlationId
           )
           continue
         }
@@ -203,9 +285,19 @@ class SchedulerService {
         const isTimeForRecording = now >= new Date(startTime.getTime() - 60000) && now < endTime
 
         if (isTimeForRecording && !ffmpegService.isRecording(match.id)) {
-          await this.processRecordingStart(match, now, endTime)
+          await this.processRecordingStart(
+            match,
+            now,
+            endTime,
+            false,
+            correlationId
+          )
         } else if (now >= endTime && !ffmpegService.isRecording(match.id)) {
-          await this.markMatchFailed(match, 'recording window expired without recording starting')
+          await this.markMatchFailed(
+            match,
+            'recording window expired without recording starting',
+            correlationId
+          )
         }
       }
 
@@ -327,7 +419,8 @@ class SchedulerService {
     match: Match,
     now: Date,
     endTime: Date,
-    statusAlreadySet = false
+    statusAlreadySet = false,
+    correlationId: string = randomUUID()
   ): Promise<void> {
     const db = dbService.getClient()
     const profileId = match.profile_id || dbService.getProfileId()
@@ -343,7 +436,8 @@ class SchedulerService {
     ) {
       await this.markMatchFailed(
         match,
-        `invalid recording timing: start=${match.start_time}, end=${match.end_time}, now=${now.toISOString()}`
+        `invalid recording timing: start=${match.start_time}, end=${match.end_time}, now=${now.toISOString()}`,
+        correlationId
       )
       return
     }
@@ -352,7 +446,8 @@ class SchedulerService {
     if (!Number.isFinite(durationSeconds) || durationSeconds < 1) {
       await this.markMatchFailed(
         match,
-        `invalid remaining recording duration: ${durationSeconds}s (start=${match.start_time}, end=${match.end_time})`
+        `invalid remaining recording duration: ${durationSeconds}s (start=${match.start_time}, end=${match.end_time})`,
+        correlationId
       )
       return
     }
@@ -360,7 +455,7 @@ class SchedulerService {
     // Resolve the local video source. The scheduler does not know recorder vendors or RTSP paths.
     const court = profileId ? localCourtService.getById(match.court_id, profileId) : null
     if (!court || !profileId) {
-      await this.markMatchFailed(match, 'local court configuration is missing')
+      await this.markMatchFailed(match, 'local court configuration is missing', correlationId)
       return
     }
 
@@ -370,6 +465,7 @@ class SchedulerService {
       component: 'scheduler',
       action: 'recording-lifecycle',
       status: 'started',
+      correlationId,
       message: `La grabación está por comenzar para ${this.matchContext(match)}.`,
       metadata: {
         matchId: match.id,
@@ -415,6 +511,7 @@ class SchedulerService {
         component: 'scheduler',
         action: 'resolve-video-source',
         status: 'success',
+        correlationId,
         message: `La fuente de video fue resuelta para ${this.matchContext(match)}.`,
         metadata: {
           matchId: match.id,
@@ -432,6 +529,7 @@ class SchedulerService {
         component: 'scheduler',
         action: 'resolve-video-source',
         status: 'failed',
+        correlationId,
         message: `No se pudo resolver la fuente de video para ${this.matchContext(match)}.`,
         metadata: {
           matchId: match.id,
@@ -440,14 +538,14 @@ class SchedulerService {
         },
         error
       })
-      await this.markMatchFailed(match, `video source resolution failed: ${detail}`)
+      await this.markMatchFailed(match, `video source resolution failed: ${detail}`, correlationId)
       return
     }
 
     const outputFilePath = path.join(this.tempDir, `${match.id}.mp4`)
     const recordingStartedAt = Date.now()
 
-    console.log(`Starting ${this.matchContext(match)}. Duration: ${durationSeconds}s`)
+      console.log(`Starting ${this.matchContext(match)}. Duration: ${durationSeconds}s`)
 
     try {
       // 2. Set status to RECORDING in Supabase unless an on-demand start already did it.
@@ -468,6 +566,7 @@ class SchedulerService {
       // 3. Trigger FFmpeg recording
       ffmpegService.startRecording({
         matchId: match.id,
+        correlationId,
         rtspUrl,
         durationSeconds,
         outputFilePath,
@@ -485,14 +584,17 @@ class SchedulerService {
           // that explicit marker is still treated as a failed recording.
           const elapsedSeconds = Math.floor((Date.now() - recordingStartedAt) / 1000)
           if (elapsedSeconds < durationSeconds && !completion.manualStop) {
+            this.stopRecordingHeartbeat(match.id)
             await releaseVideoSource?.()
             await this.markMatchFailed(
               match,
-              `recording ended early after ${elapsedSeconds}s; expected ${durationSeconds}s. The local file cannot be treated as complete.`
+              `recording ended early after ${elapsedSeconds}s; expected ${durationSeconds}s. The local file cannot be treated as complete.`,
+              correlationId
             )
             return
           }
 
+          this.stopRecordingHeartbeat(match.id)
           console.log(
             `Recording ${completion.manualStop ? 'manually stopped' : 'complete'} for ${this.matchContext(match)}. Local file: ${savedPath}`
           )
@@ -502,6 +604,7 @@ class SchedulerService {
             component: 'scheduler',
             action: 'recording-lifecycle',
             status: 'success',
+            correlationId,
             message: `El archivo local de ${this.matchContext(match)} está listo para subir.`,
             durationMs: elapsedSeconds * 1000,
             metadata: {
@@ -520,9 +623,10 @@ class SchedulerService {
               ? `La grabación parcial de ${match.player_name} se está subiendo.`
               : `La grabación para ${match.player_name} finalizó. Procesando subida...`
           )
-          await this.processUploadStart(match, savedPath)
+          await this.processUploadStart(match, savedPath, correlationId)
         },
         onError: async (err) => {
+          this.stopRecordingHeartbeat(match.id)
           const detail = err instanceof Error ? err.message : String(err)
           console.error(`Recording error for ${this.matchContext(match)}:`, detail)
           supportDiagnosticsService.record({
@@ -531,6 +635,7 @@ class SchedulerService {
             component: 'scheduler',
             action: 'recording-lifecycle',
             status: 'failed',
+            correlationId,
             message: `Falló la grabación de ${this.matchContext(match)}.`,
             metadata: {
               matchId: match.id,
@@ -546,20 +651,52 @@ class SchedulerService {
             'Error de Grabación',
             `Ocurrió un error al grabar el partido de ${match.player_name}.`
           )
-          await this.markMatchFailed(match, `recording failed: ${detail}`)
+          await this.markMatchFailed(match, `recording failed: ${detail}`, correlationId)
         }
       })
+      if (ffmpegService.isRecording(match.id)) {
+        supportDiagnosticsService.record({
+          level: 'info',
+          event: 'recording.started',
+          component: 'scheduler',
+          action: 'recording-lifecycle',
+          status: 'success',
+          correlationId,
+          message: `La grabación inició correctamente para ${this.matchContext(match)}.`,
+          metadata: {
+            matchId: match.id,
+            courtId: match.court_id,
+            courtName: court.name,
+            scheduledStart: match.start_time,
+            scheduledEnd: match.end_time,
+            durationSeconds,
+            activeRecordingCount: ffmpegService.getActiveCount()
+          }
+        })
+        this.startRecordingHeartbeat(
+          match,
+          correlationId,
+          recordingStartedAt,
+          durationSeconds,
+          endTime
+        )
+      }
     } catch (err) {
+      this.stopRecordingHeartbeat(match.id)
       await releaseVideoSource?.()
       const detail = err instanceof Error ? err.message : String(err)
-      await this.markMatchFailed(match, `failed to initialize recording: ${detail}`)
+      await this.markMatchFailed(match, `failed to initialize recording: ${detail}`, correlationId)
     }
   }
 
   /**
    * Handle uploading a completed video.
    */
-  private async processUploadStart(match: Match, filePath: string): Promise<void> {
+  private async processUploadStart(
+    match: Match,
+    filePath: string,
+    correlationId: string = randomUUID()
+  ): Promise<void> {
     const db = dbService.getClient()
 
     try {
@@ -587,6 +724,7 @@ class SchedulerService {
         component: 'r2',
         action: 'upload-video',
         status: 'started',
+        correlationId,
         message: `Comenzó la subida del video de ${this.matchContext(match)}.`,
         metadata: {
           matchId: match.id,
@@ -624,6 +762,7 @@ class SchedulerService {
         component: 'r2',
         action: 'upload-video',
         status: 'success',
+        correlationId,
         message: `La subida del video de ${this.matchContext(match)} finalizó correctamente.`,
         metadata: {
           matchId: match.id,
@@ -652,6 +791,7 @@ class SchedulerService {
         component: 'r2',
         action: 'upload-video',
         status: 'failed',
+        correlationId,
         message,
         metadata: {
           matchId: match.id,
@@ -672,6 +812,7 @@ class SchedulerService {
           error_log: message
         })
         .eq('id', match.id)
+      this.scheduledCorrelations.delete(match.id)
       this.notifyUI('match-updated', match.id)
     }
   }
