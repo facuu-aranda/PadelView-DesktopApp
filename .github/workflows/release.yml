@@ -21,9 +21,20 @@ jobs:
           node-version: 20
 
       - name: Install Dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Build and Publish
+      - name: Build and Publish Windows Installer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run build:win -- -p always
+        run: npm run build:win -- --publish always
+
+      - name: Upload Windows Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ViewPadel-Windows-${{ github.ref_name }}
+          path: |
+            dist/ViewPadel-Setup.exe
+            dist/ViewPadel-Setup.exe.blockmap
+            dist/latest.yml
+          if-no-files-found: error

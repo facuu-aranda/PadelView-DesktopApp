@@ -1,4 +1,11 @@
 {
+  "1.6.3": {
+    "title": "Actualización de estabilidad",
+    "items": [
+      "Incluye las últimas mejoras de diagnóstico y seguimiento de grabaciones.",
+      "Mayor confiabilidad al preparar e instalar nuevas versiones de ViewPadel."
+    ]
+  },
   "1.6.2": {
     "title": "Diagnóstico más preciso de grabaciones",
     "items": [
