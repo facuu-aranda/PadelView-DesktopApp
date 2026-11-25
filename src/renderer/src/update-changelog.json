@@ -1,4 +1,11 @@
 {
+  "1.6.4": {
+    "title": "Actualización de estabilidad",
+    "items": [
+      "Incluye las últimas mejoras de diagnóstico y seguimiento de grabaciones.",
+      "El instalador de Windows se prepara de forma más confiable para las actualizaciones automáticas."
+    ]
+  },
   "1.6.3": {
     "title": "Actualización de estabilidad",
     "items": [
