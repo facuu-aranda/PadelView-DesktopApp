@@ -1,4 +1,11 @@
 {
+  "1.6.5": {
+    "title": "Actualización más confiable",
+    "items": [
+      "Mejora la publicación del instalador y de las actualizaciones automáticas de ViewPadel.",
+      "Incluye las últimas mejoras de diagnóstico y seguimiento de grabaciones."
+    ]
+  },
   "1.6.4": {
     "title": "Actualización de estabilidad",
     "items": [
